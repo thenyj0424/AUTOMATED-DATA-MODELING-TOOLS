@@ -5,8 +5,9 @@ scikit-learn==1.5.1
 matplotlib==3.9.0
 seaborn==0.13.2
 python-dotenv==1.0.1
-langchain-core==0.2.38
-langchain-groq==0.1.9
+langchain-core>=0.2.38,<0.3
+langchain-groq>=0.1.9,<0.2
+langgraph>=0.2.35,<0.3
 statsmodels==0.14.2
 optuna==3.6.1
 

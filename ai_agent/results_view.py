@@ -8,6 +8,7 @@ import seaborn as sns
 import streamlit as st
 
 from ai_agent.copilot_utils import add_agent_activity, add_chat_message, build_hybrid_step_hint, summarize_results_for_ai
+from ai_agent.workflow_tools import build_report_payload
 
 
 def _format_metric_value(value: Any) -> str:
@@ -180,6 +181,7 @@ def render_results_view(
 	metric_name, metric_value = _pick_primary_metric(results)
 	primary_insight = _build_ai_insight_text(results)
 	top_features = _extract_top_features(results.get("baseline_insights", {}) or {}, limit=3)
+	st.session_state["report_payload"] = build_report_payload(results, results_tuned, summary)
 
 	header_left, header_mid, header_right = st.columns([1.1, 1.1, 1.2])
 	with header_left:

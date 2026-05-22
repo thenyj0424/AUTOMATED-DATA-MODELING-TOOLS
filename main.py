@@ -85,10 +85,17 @@ from ai_agent.tuning import run_tuning, is_optuna_available
 from ai_agent.results_view import render_results_view
 from ai_agent.copilot_utils import (
 	build_copilot_context,
+	build_meta_help_reply,
+	build_dataset_analysis_context,
+	condense_user_facing_text,
+	sanitize_user_facing_text,
+	strip_internal_plan_payload,
 	summarize_results_for_ai,
 	update_preferences_from_text,
 	format_preferences_for_context,
+	is_meta_help_request,
 	is_requirement_message,
+	is_dataset_question,
 )
 from ai_agent.rag_store import build_workflow_rag_context
 
@@ -252,8 +259,17 @@ def render_activity_toasts() -> None:
 			root = doc.createElement('div');
 			root.id = 'agent-toast-root';
 			root.className = 'ui-toast-root';
-			doc.body.appendChild(root);
+			(root.parentNode || doc.body || doc.documentElement).appendChild(root);
 		}}
+		root.style.position = 'fixed';
+		root.style.right = '1rem';
+		root.style.bottom = '1rem';
+		root.style.zIndex = '99999';
+		root.style.display = 'flex';
+		root.style.flexDirection = 'column';
+		root.style.gap = '0.5rem';
+		root.style.width = 'min(24rem, calc(100vw - 2rem))';
+		root.style.pointerEvents = 'none';
 		root.innerHTML = '';
 		for (let i = 0; i < data.length; i += 1) {{
 			const item = data[i] || {{}};
@@ -261,6 +277,7 @@ def render_activity_toasts() -> None:
 			const level = (item.level || 'info').toLowerCase();
 			toast.className = `ui-toast ui-toast-${{level}}`;
 			toast.style.animationDelay = `${{i * 0.08}}s`;
+			toast.style.pointerEvents = 'auto';
 
 			const timeTag = doc.createElement('span');
 			timeTag.className = 'ui-toast-time';
@@ -385,7 +402,7 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 		st.caption(f"Hint: {rule_or_hybrid_hint}")
 
 		if st.session_state.get("agent_auto_mode", False):
-			st.info("Suggestions only. AI will not advance steps; use Continue when ready.")
+			add_agent_activity("Suggestions only. Auto AI will not advance steps; use Continue when ready.")
 			last_applied = st.session_state.get("agent_auto_last_applied", [])
 			if last_applied:
 				st.caption(f"Applied suggestions: {', '.join(last_applied[:5])}")
@@ -430,22 +447,51 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 						reqs.insert(0, {"text": user_text, "time": datetime.now().isoformat()})
 						st.session_state["agent_requirements"] = reqs[:50]
 						add_chat_message("assistant", "Noted. Requirement recorded.")
-						add_agent_activity("Requirement recorded via chat.")
+						# Parse and apply the requirement to session state so subsequent choices honor it.
+						from ai_agent.copilot_utils import apply_requirement_to_state
+						applied_notes = apply_requirement_to_state(user_text)
+						for note in applied_notes:
+							add_agent_activity(note)
+						add_agent_activity("Auto AI recorded the requirement.")
 						# Keep the user's goal recorded but do not prompt the LLM.
 						st.session_state["agent_goal"] = user_text
 					else:
 						with st.spinner("AI thinking..."):
 							context = build_copilot_context(step, df, summary)
-							# Include a clarifying-instruction only for non-requirement messages.
-							prompt = (
-								"You are the app's AI agent. Follow the user's request exactly when possible. "
-								"Be concise, action-oriented, and do not ignore the user's goal. "
-								"Respect stored user preferences when proposing model choices unless the data constraints conflict, then explain briefly.\n"
-								f"Current workflow context:\n{context}\n\n"
-								f"User request to follow:\n{user_text}"
-							)
-							route_model = classify_task_route(user_text, context)
-							reply = call_groq(prompt, max_new_tokens=180, task_type="chat", context=context, force_model=route_model) or ""
+							dataset_question = is_dataset_question(user_text, step, df, summary)
+							if is_meta_help_request(user_text):
+								reply = build_meta_help_reply(user_text, st.session_state.get("agent_goal", ""))
+							elif dataset_question:
+								dataset_context = build_dataset_analysis_context(step, df, summary, user_text)
+								prompt = (
+									"You are Auto AI. Give the final recommendation first. "
+									"Keep the reply to 1-3 short sentences. Do not describe your reasoning process or mention internal analysis. "
+									"Use the tool-backed EDA bundle only to support the final answer, and mention missingness, stationarity, or target cues only if they directly help the result. "
+									"Do not mention model labels or phrases like 'the user wants'.\n"
+									f"Current workflow context:\n{context}\n\n"
+									f"Tool-backed EDA bundle:\n{dataset_context['prompt_context']}\n\n"
+									f"User question:\n{user_text}"
+								)
+								add_agent_activity("Auto AI used perform_eda for the dataset question.")
+								reply = call_groq(
+									prompt,
+									max_new_tokens=240,
+									task_type="reasoning",
+									context=dataset_context["prompt_context"],
+									force_model=DEFAULT_REASONER_MODEL,
+								) or ""
+							else:
+								# Include a clarifying-instruction only for non-requirement messages.
+								prompt = (
+									"You are Auto AI. Answer with the result first. "
+									"Keep the reply short, direct, and action-oriented. Do not explain your thinking unless the user asks for it. "
+									"Respect stored user preferences when proposing model choices unless the data constraints conflict, then explain in one short sentence. "
+									"Do not mention which model is speaking and do not use self-interpretations like 'the user wants'.\n"
+									f"Current workflow context:\n{context}\n\n"
+									f"User request to follow:\n{user_text}"
+								)
+								route_model = classify_task_route(user_text, context)
+								reply = call_groq(prompt, max_new_tokens=180, task_type="chat", context=context, force_model=route_model) or ""
 						if reply.startswith("ERROR:"):
 							add_agent_activity(reply, level="error")
 							reply = (
@@ -454,38 +500,39 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 							)
 						elif not reply.strip():
 							reply = build_rule_based_step_hint(step, df, summary)
+						reply = condense_user_facing_text(strip_internal_plan_payload(sanitize_user_facing_text(reply)))
 						add_chat_message("assistant", reply)
-						add_agent_activity("AI replied to chat.")
+						add_agent_activity("Auto AI replied to chat.")
 				else:
 					add_chat_message("assistant", "LLM not configured. Set GROQ_API_KEY to enable responses.")
 					add_agent_activity("LLM not configured; no reply.", level="warn")
 
-			with conversation_slot:
-				st.markdown("<div class='ui-copilot-chat-title'>Conversation</div>", unsafe_allow_html=True)
-				st.markdown("<div class='ui-chat-messages'>", unsafe_allow_html=True)
-				for msg in st.session_state.get("agent_chat_messages", [])[-8:]:
-					is_user = msg.get("role") == "user"
-					row_class = "user" if is_user else "ai"
-					text = html.escape(str(msg.get("content", ""))).replace("\n", "<br>")
-					st.markdown(
-						f"<div class='ui-chat-bubble-row {row_class}'><div class='ui-chat-bubble {row_class}'>{text}</div></div>",
-						unsafe_allow_html=True,
-					)
-				if not st.session_state.get("agent_chat_messages"):
-					st.caption("No messages yet.")
-				st.markdown("</div>", unsafe_allow_html=True)
-				st.components.v1.html(
-					"""
-					<script>
-					const root = window.parent.document;
-					const messages = root.querySelector('.ui-chat-messages');
-					if (messages) {
-						messages.scrollTop = messages.scrollHeight;
-					}
-					</script>
-					""",
-					height=0,
+		with conversation_slot:
+			st.markdown("<div class='ui-copilot-chat-title'>Conversation</div>", unsafe_allow_html=True)
+			st.markdown("<div class='ui-chat-messages'>", unsafe_allow_html=True)
+			for msg in st.session_state.get("agent_chat_messages", [])[-20:]:
+				is_user = msg.get("role") == "user"
+				row_class = "user" if is_user else "ai"
+				text = html.escape(str(msg.get("content", ""))).replace("\n", "<br>")
+				st.markdown(
+					f"<div class='ui-chat-bubble-row {row_class}'><div class='ui-chat-bubble {row_class}'>{text}</div></div>",
+					unsafe_allow_html=True,
 				)
+			if not st.session_state.get("agent_chat_messages"):
+				st.caption("No messages yet.")
+			st.markdown("</div>", unsafe_allow_html=True)
+			st.components.v1.html(
+				"""
+				<script>
+				const root = window.parent.document;
+				const messages = root.querySelector('.ui-chat-messages');
+				if (messages) {
+					messages.scrollTop = messages.scrollHeight;
+				}
+				</script>
+				""",
+				height=0,
+			)
 
 
 def run_step_auto_actions(step: int) -> None:
@@ -921,6 +968,17 @@ def inject_ui_styles() -> None:
 			text-shadow: 0 1px 0 rgba(1, 6, 20, 0.55);
 			animation: toastInOut 5.2s ease forwards;
 		}
+			.ui-toast-root {
+				position: fixed;
+				right: 1rem;
+				bottom: 1rem;
+				z-index: 99999;
+				display: flex;
+				flex-direction: column;
+				gap: 0.5rem;
+				width: min(24rem, calc(100vw - 2rem));
+				pointer-events: none;
+			}
 		.ui-toast-time {
 			display: inline-block;
 			font-size: 0.76rem;

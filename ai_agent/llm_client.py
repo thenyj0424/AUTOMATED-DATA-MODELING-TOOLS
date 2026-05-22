@@ -9,7 +9,7 @@ from langchain_groq import ChatGroq
 BASE_DIR = Path(__file__).resolve().parent.parent
 KNOWLEDGE_BASE_DIR = BASE_DIR / "knowledge_base"
 DEFAULT_ROUTER_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip().strip('"').strip("'")
-DEFAULT_REASONER_MODEL = os.getenv("GROQ_MODEL2", "llama-4-scout-17b-16e-instruct").strip().strip('"').strip("'")
+DEFAULT_REASONER_MODEL = os.getenv("GROQ_MODEL2", "meta-llama/llama-4-scout-17b-16e-instruct").strip().strip('"').strip("'")
 DEFAULT_REVIEWER_MODEL = os.getenv("GROQ_MODEL3", "llama-3.3-70b-versatile").strip().strip('"').strip("'")
 
 LLM_MODEL = DEFAULT_ROUTER_MODEL
