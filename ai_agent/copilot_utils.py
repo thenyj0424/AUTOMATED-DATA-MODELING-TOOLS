@@ -1,12 +1,34 @@
 from __future__ import annotations
 
 from datetime import datetime
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 from ai_agent.llm_client import call_groq, groq_token_loaded
+from ai_agent.rag_store import build_workflow_rag_context
+
+
+def is_requirement_message(user_text: str) -> bool:
+	"""Heuristic to detect requirement-style messages.
+
+	Treat messages as requirements when the user labels them (e.g. "Requirement:")
+	or when the text is declarative (no question mark) and reasonably long.
+	"""
+	if not user_text:
+		return False
+	txt = user_text.strip()
+	lower = txt.lower()
+	if lower.startswith(("requirement:", "requirement -", "req:", "req -")):
+		return True
+	if "requirement" in lower:
+		return True
+	# Declarative heuristic: no question mark and at least 5 words
+	if "?" not in txt and len(txt.split()) >= 5:
+		return True
+	return False
 
 
 def _last_match_index(text: str, phrases: List[str]) -> int:
@@ -81,6 +103,7 @@ def add_agent_activity(message: str, level: str = "info") -> None:
 		0,
 		{
 			"time": datetime.now().strftime("%H:%M:%S"),
+			"ts": time.time(),
 			"level": level,
 			"message": message,
 		},
@@ -117,6 +140,12 @@ def build_rule_based_step_hint(step: int, df: Optional[pd.DataFrame], summary: A
 
 def build_copilot_context(step: int, df: Optional[pd.DataFrame], summary: Any) -> str:
 	parts = [f"Step: {step}"]
+	# System policy: treat requirement-style chat messages as record-only.
+	parts.append(
+		"System policy: When the user sends a requirement (a declarative instruction),"
+		" acknowledge with a short 'Noted' and record it. Do not ask clarifying"
+		" questions unless the user explicitly requests a recommendation or asks a question."
+	)
 	current_goal = st.session_state.get("agent_goal")
 	if current_goal:
 		parts.append(f"Current user request: {current_goal}")
@@ -145,6 +174,18 @@ def build_copilot_context(step: int, df: Optional[pd.DataFrame], summary: Any) -
 		activity_bits = [item.get("message", "") for item in last_activity if item.get("message")]
 		if activity_bits:
 			parts.append(f"Recent AI actions: {' | '.join(activity_bits)}")
+	column_text = " ".join(map(str, list(df.columns)[:20])) if df is not None else ""
+	summary_text = ""
+	if summary is not None:
+		summary_text = f"rows={summary.rows} cols={summary.cols} numeric={len(summary.numeric_cols)} categorical={len(summary.categorical_cols)} datetime={len(summary.datetime_cols)}"
+	knowledge_context = build_workflow_rag_context(
+		step,
+		user_goal=str(current_goal or ""),
+		column_text=column_text,
+		summary_text=summary_text,
+	)
+	if knowledge_context:
+		parts.append(f"Knowledge base guidance:\n{knowledge_context}")
 	return "\n".join(parts)
 
 
@@ -158,7 +199,7 @@ def build_hybrid_step_hint(step: int, df: Optional[pd.DataFrame], summary: Any) 
 		f"Rule hint: {rule_hint}\n"
 		f"Context:\n{build_copilot_context(step, df, summary)}"
 	)
-	text = call_groq(prompt, max_new_tokens=60)
+	text = call_groq(prompt, max_new_tokens=60, task_type="reasoning")
 	if text and not text.startswith("ERROR:"):
 		return text
 	return rule_hint

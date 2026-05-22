@@ -4,7 +4,7 @@ import html
 import time
 import json
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -61,8 +61,13 @@ from ai_agent.llm_client import (
 	call_groq,
 	groq_token_loaded,
 	LLM_MODEL,
+	DEFAULT_ROUTER_MODEL,
+	DEFAULT_REASONER_MODEL,
+	DEFAULT_REVIEWER_MODEL,
 	build_system_message_prompt,
 	explain_groq_error,
+	classify_task_route,
+	should_use_reviewer,
 )
 from ai_agent.modeling import (
 	apply_target_missing,
@@ -83,7 +88,9 @@ from ai_agent.copilot_utils import (
 	summarize_results_for_ai,
 	update_preferences_from_text,
 	format_preferences_for_context,
+	is_requirement_message,
 )
+from ai_agent.rag_store import build_workflow_rag_context
 
 BASE_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
@@ -201,12 +208,18 @@ def add_agent_activity(message: str, level: str = "info") -> None:
 def render_activity_toasts() -> None:
 	now_ts = time.time()
 	recent = []
-	for item in st.session_state.get("agent_activity", []):
+	activity = st.session_state.get("agent_activity", [])
+	for item in activity:
 		ts = item.get("ts")
+		# Backward compatibility: older activity entries may not have timestamps.
+		if not isinstance(ts, (int, float)):
+			ts = now_ts
+			item["ts"] = ts
 		if isinstance(ts, (int, float)) and (now_ts - ts) <= 6:
 			recent.append(item)
 		if len(recent) >= 3:
 			break
+	st.session_state["agent_activity"] = activity[:20]
 	if not recent:
 		st.components.v1.html(
 			"""
@@ -349,7 +362,7 @@ def build_hybrid_step_hint(step: int, df: Optional[pd.DataFrame], summary: Any) 
 		f"Rule hint: {rule_hint}\n"
 		f"Context: {context}"
 	)
-	text = call_groq(prompt, max_new_tokens=60)
+	text = call_groq(prompt, max_new_tokens=60, task_type="reasoning")
 	if text and not text.startswith("ERROR:"):
 		return text
 	return rule_hint
@@ -411,27 +424,38 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 					for message in preference_updates:
 						add_agent_activity(message)
 				if groq_token_loaded():
-					with st.spinner("AI thinking..."):
-						context = build_copilot_context(step, df, summary)
-						prompt = (
-							"You are the app's AI agent. Follow the user's request exactly when possible. "
-							"If anything is unclear, ask one short clarifying question. "
-							"Be concise, action-oriented, and do not ignore the user's goal. "
-							"Respect stored user preferences when proposing model choices unless the data constraints conflict, then explain briefly.\n"
-							f"Current workflow context:\n{context}\n\n"
-							f"User request to follow:\n{user_text}"
-						)
-						reply = call_groq(prompt, max_new_tokens=180) or ""
-					if reply.startswith("ERROR:"):
-						add_agent_activity(reply, level="error")
-						reply = (
-							f"{explain_groq_error(reply)} "
-							f"{build_rule_based_step_hint(step, df, summary)}"
-						)
-					elif not reply.strip():
-						reply = build_rule_based_step_hint(step, df, summary)
-					add_chat_message("assistant", reply)
-					add_agent_activity("AI replied to chat.")
+					# If the message is a requirement, record it and acknowledge — do not call the LLM.
+					if is_requirement_message(user_text):
+						reqs = st.session_state.get("agent_requirements", [])
+						reqs.insert(0, {"text": user_text, "time": datetime.now().isoformat()})
+						st.session_state["agent_requirements"] = reqs[:50]
+						add_chat_message("assistant", "Noted. Requirement recorded.")
+						add_agent_activity("Requirement recorded via chat.")
+						# Keep the user's goal recorded but do not prompt the LLM.
+						st.session_state["agent_goal"] = user_text
+					else:
+						with st.spinner("AI thinking..."):
+							context = build_copilot_context(step, df, summary)
+							# Include a clarifying-instruction only for non-requirement messages.
+							prompt = (
+								"You are the app's AI agent. Follow the user's request exactly when possible. "
+								"Be concise, action-oriented, and do not ignore the user's goal. "
+								"Respect stored user preferences when proposing model choices unless the data constraints conflict, then explain briefly.\n"
+								f"Current workflow context:\n{context}\n\n"
+								f"User request to follow:\n{user_text}"
+							)
+							route_model = classify_task_route(user_text, context)
+							reply = call_groq(prompt, max_new_tokens=180, task_type="chat", context=context, force_model=route_model) or ""
+						if reply.startswith("ERROR:"):
+							add_agent_activity(reply, level="error")
+							reply = (
+								f"{explain_groq_error(reply)} "
+								f"{build_rule_based_step_hint(step, df, summary)}"
+							)
+						elif not reply.strip():
+							reply = build_rule_based_step_hint(step, df, summary)
+						add_chat_message("assistant", reply)
+						add_agent_activity("AI replied to chat.")
 				else:
 					add_chat_message("assistant", "LLM not configured. Set GROQ_API_KEY to enable responses.")
 					add_agent_activity("LLM not configured; no reply.", level="warn")
@@ -479,14 +503,59 @@ def run_step_auto_actions(step: int) -> None:
 		df = st.session_state.get("df")
 		changes, activities = apply_auto_actions_snapshot(snapshot, step, df)
 
+		current_goal = str(st.session_state.get("agent_goal", "") or "").strip()
+		if groq_token_loaded():
+			column_text = " ".join(map(str, list(df.columns)[:20])) if df is not None else ""
+			summary_text = ""
+			summary = st.session_state.get("summary")
+			if summary is not None:
+				summary_text = (
+					f"rows={summary.rows} cols={summary.cols} "
+					f"numeric={len(summary.numeric_cols)} categorical={len(summary.categorical_cols)} "
+					f"datetime={len(summary.datetime_cols)}"
+				)
+			kb_context = build_workflow_rag_context(
+				step,
+				user_goal=current_goal,
+				column_text=column_text,
+				summary_text=summary_text,
+			)
+			auto_prompt = build_auto_mode_prompt(step, current_goal, snapshot, kb_context)
+			auto_reply = call_groq(
+				auto_prompt,
+				max_new_tokens=220,
+				task_type="reasoning",
+				context=kb_context,
+				force_model=DEFAULT_REASONER_MODEL,
+			)
+			ai_changes, ai_activities = parse_auto_mode_plan(auto_reply)
+			for key, new_val in ai_changes.items():
+				if key in {"step", "cleaning_confirmed", "analysis_ready"}:
+					continue
+				changes[key] = new_val
+			activities.extend(ai_activities)
+			if kb_context:
+				activities.append("Auto mode used the KB to align the suggestion with the fixed workflow.")
+
 		# Enforce strict gating: do not allow auto actions to change control-flow keys
 		CONTROL_KEYS = {"step", "cleaning_confirmed", "analysis_ready"}
 		applied = []
 		ignored = []
-		for key, new_val in changes.items():
+		# Apply model_family first, then model_name, then remaining keys to avoid UI mismatch.
+		ordered_keys = []
+		if "model_family" in changes:
+			ordered_keys.append("model_family")
+		if "model_name" in changes:
+			ordered_keys.append("model_name")
+		for k in list(changes.keys()):
+			if k not in ordered_keys:
+				ordered_keys.append(k)
+
+		for key in ordered_keys:
 			if key in CONTROL_KEYS:
 				ignored.append(key)
 				continue
+			new_val = changes[key]
 			old_val = st.session_state.get(key) if key in st.session_state else None
 			push_undo_snapshot(key, old_val)
 			st.session_state[key] = new_val
@@ -506,6 +575,61 @@ def run_step_auto_actions(step: int) -> None:
 
 	autorun_flags[step] = True
 	st.session_state["agent_step_autorun"] = autorun_flags
+
+
+def build_auto_mode_prompt(
+	step: int,
+	user_goal: str,
+	snapshot: Dict[str, Any],
+	kb_context: str,
+) -> str:
+	current_keys = sorted([str(key) for key in snapshot.keys() if not str(key).startswith("agent_")])
+	base_focus = {
+		"step": step,
+		"goal": user_goal or "(none)",
+		"visible_keys": current_keys[:40],
+	}
+	return (
+		"You are the auto-mode decision engine for a fixed data-modelling workflow. "
+		"The workflow cannot change. Prioritize the user's request unless it conflicts with the dataset, "
+		"the fixed workflow, or the uploaded data constraints. If the request is vague, use the KB guidance. "
+		"Use the KB as the secondary source and keep recommendations compatible with the current step. "
+		"Return JSON only using this schema: {\"changes\": {\"key\": value}, \"activities\": [\"short note\"], \"priority_source\": \"user|kb|dataset\"}. "
+		"Only suggest supported session keys and never include control-flow keys.\n"
+		f"Context: {json.dumps(base_focus, ensure_ascii=True)}\n"
+		f"Knowledge base guidance:\n{kb_context or '(no kb context available)'}"
+	)
+
+
+def parse_auto_mode_plan(reply_text: Optional[str]) -> Tuple[Dict[str, Any], List[str]]:
+	if not reply_text:
+		return {}, []
+	text = str(reply_text).strip()
+	if text.startswith("```"):
+		text = text.strip("`")
+		if text.lower().startswith("json"):
+			text = text[4:].strip()
+	start = text.find("{")
+	end = text.rfind("}")
+	if start < 0 or end < 0 or end <= start:
+		return {}, []
+	try:
+		payload = json.loads(text[start : end + 1])
+	except Exception:
+		return {}, []
+	changes = payload.get("changes") or {}
+	activities = payload.get("activities") or []
+	if not isinstance(changes, dict):
+		changes = {}
+	if not isinstance(activities, list):
+		activities = []
+	clean_changes: Dict[str, Any] = {}
+	for key, value in changes.items():
+		if str(key).startswith("agent_"):
+			continue
+		clean_changes[str(key)] = value
+	clean_activities = [str(item) for item in activities if str(item).strip()]
+	return clean_changes, clean_activities
 
 
 def clear_tuned_state() -> None:
@@ -534,7 +658,7 @@ def render_system_message(step_name: str, summary: Optional[Any]) -> None:
 		)
 	prompt = build_system_message_prompt(step_name, context)
 	with st.spinner("Generating guidance..."):
-		text = call_groq(prompt, max_new_tokens=80)
+		text = call_groq(prompt, max_new_tokens=80, task_type="reasoning", context=context)
 	if text:
 		st.info(text)
 
@@ -1174,7 +1298,7 @@ def build_llm_summary(df: pd.DataFrame, summary: Any) -> str:
 	num_desc = describe_numeric(df, summary.numeric_cols)
 	num_text = num_desc.head(10).to_string() if not num_desc.empty else "No numeric stats"
 	prompt = build_prompt(overview_text, missing_text, num_text)
-	return call_groq(prompt) or ""
+	return call_groq(prompt, task_type="reasoning", context=overview_text) or ""
 
 
 def detect_unacceptable_features(
@@ -1967,6 +2091,77 @@ def main() -> None:
 			save_widget_state("step3_state", step3_keys)
 			st.stop()
 
+		# Apply explicit requested model/family from requirement text before rendering controls.
+		req_texts = []
+		if st.session_state.get("agent_goal"):
+			req_texts.append(str(st.session_state.get("agent_goal")))
+		for req in st.session_state.get("agent_requirements", []) or []:
+			if isinstance(req, dict):
+				req_texts.append(str(req.get("text", "")))
+			else:
+				req_texts.append(str(req))
+
+		def _extract_requested_model(text: str):
+			req_blob = str(text or "").lower().replace("-", " ").replace("_", " ")
+			req_compact = req_blob.replace(" ", "")
+			tokens = req_blob.split()
+			if "decision tree" in req_blob or "decisiontree" in req_compact or "dtree" in req_compact or ((any(tok.startswith("deci") or tok in {"decison", "descision", "dcsn"} for tok in tokens)) and ("tree" in tokens)):
+				return "Decision Tree", "ML"
+			if "random forest" in req_blob or "randomforest" in req_compact or "rf" in tokens or ((any(tok.startswith("rand") or tok in {"ranom", "rendom"} for tok in tokens)) and ("forest" in tokens)):
+				return "Random Forest", "ML"
+			if "gradient boosting" in req_blob or "gradientboosting" in req_compact or "xgboost" in req_compact:
+				return "Gradient Boosting", "ML"
+			if "knn" in req_blob or "k nearest" in req_blob or "nearest neighbor" in req_blob:
+				return "KNN", "ML"
+			if " svm" in f" {req_blob}" or "support vector" in req_blob:
+				return "SVM", "ML"
+			if "svr" in req_blob:
+				return "SVR", "ML"
+			if "logistic" in req_blob:
+				return "Logistic Regression", "Statistical"
+			if "linear regression" in req_blob or "linearregression" in req_compact:
+				return "Linear Regression", "Statistical"
+			if "ridge" in req_blob:
+				return "Ridge", "Statistical"
+			if "lasso" in req_blob:
+				return "Lasso", "Statistical"
+			return None, None
+
+		requested_model = None
+		requested_family = None
+		for text in req_texts:
+			requested_model, requested_family = _extract_requested_model(text)
+			if requested_model:
+				break
+
+		if requested_model:
+			st.session_state["model_family"] = requested_family
+			st.session_state["model_name"] = requested_model
+
+		# Guard against invalid persisted family values (for example "decision_tree")
+		# that can break Streamlit selectbox serialization.
+		current_family = st.session_state.get("model_family")
+		valid_families = ["Statistical", "ML"]
+		if current_family and current_family not in valid_families:
+			family_text = str(current_family).strip().lower().replace("-", "_").replace(" ", "_")
+			if family_text in {"ml", "machine_learning", "machinelearning"}:
+				st.session_state["model_family"] = "ML"
+			elif family_text in {"statistical", "stats", "statistics"}:
+				st.session_state["model_family"] = "Statistical"
+			else:
+				# Infer safest family from current model name if possible.
+				current_model = str(st.session_state.get("model_name") or "").strip()
+				if current_model in (ML_CLASSIFICATION_MODELS + ML_REGRESSION_MODELS):
+					st.session_state["model_family"] = "ML"
+				elif current_model in (STATISTICAL_CLASSIFICATION_MODELS + STATISTICAL_REGRESSION_MODELS):
+					st.session_state["model_family"] = "Statistical"
+				else:
+					st.session_state["model_family"] = "ML"
+			add_agent_activity(
+				f"Invalid model family '{current_family}' normalized to '{st.session_state.get('model_family')}'.",
+				level="warn",
+			)
+
 		model_family = st.selectbox(
 			"Model family",
 			["Statistical", "ML"],
@@ -1981,6 +2176,12 @@ def main() -> None:
 				if model_family == "Statistical"
 				else ML_CLASSIFICATION_MODELS
 			)
+			# Ensure stored model_name is present in the current options; otherwise pick a safe default.
+			current_model = st.session_state.get("model_name")
+			if current_model and current_model not in model_options:
+				st.session_state["agent_activity"] = st.session_state.get("agent_activity", [])[:50]
+				st.session_state["agent_activity"].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "level": "warn", "message": f"Requested model '{current_model}' not valid for family '{model_family}'; defaulting to '{model_options[0]}'"})
+				st.session_state["model_name"] = model_options[0]
 			model_name = st.selectbox("Model", model_options, key="model_name")
 			metric_label = st.selectbox(
 				"Metric to optimize",
@@ -1994,6 +2195,11 @@ def main() -> None:
 				if model_family == "Statistical"
 				else ML_REGRESSION_MODELS
 			)
+			current_model = st.session_state.get("model_name")
+			if current_model and current_model not in model_options:
+				st.session_state["agent_activity"] = st.session_state.get("agent_activity", [])[:50]
+				st.session_state["agent_activity"].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "level": "warn", "message": f"Requested model '{current_model}' not valid for family '{model_family}'; defaulting to '{model_options[0]}'"})
+				st.session_state["model_name"] = model_options[0]
 			model_name = st.selectbox("Model", model_options, key="model_name")
 			metric_label = st.selectbox(
 				"Metric to optimize",
@@ -2047,7 +2253,8 @@ def main() -> None:
 				f"Features: {feature_text}."
 			)
 			with st.spinner("Checking feature suitability..."):
-				st.session_state["feature_warning"] = call_groq(prompt)
+				selected_model = DEFAULT_REVIEWER_MODEL if should_use_reviewer(prompt) else DEFAULT_REASONER_MODEL
+				st.session_state["feature_warning"] = call_groq(prompt, task_type="review", force_model=selected_model)
 		if deterministic_flags:
 			st.warning(
 				"Unacceptable features detected (likely date/time-derived): "

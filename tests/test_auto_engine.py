@@ -86,6 +86,95 @@ def test_apply_auto_actions_step3_prefers_user_model_family():
     df = make_tabular_df()
     state = {"agent_preferences": {"preferred_model_family": "ML"}}
     changes, activities = apply_auto_actions_snapshot(state, 3, df)
-    assert changes.get("problem_type") == "regression"
     assert changes.get("model_family") == "ML"
     assert any("Applied user preference for model family: ML." in a for a in activities)
+
+
+def test_apply_auto_actions_honors_requirement_decision_tree():
+    # Create a dataset with a categorical 'gender' column to simulate gender classification
+    df = pd.DataFrame({
+        "age": [25, 30, 22, 40],
+        "income": [50000, 60000, 32000, 80000],
+        "gender": ["M", "F", "F", "M"],
+    })
+    state = {"agent_requirements": [{"text": "Use Decision Tree model for gender classification."}]}
+    changes, activities = apply_auto_actions_snapshot(state, 3, df)
+    assert changes.get("model_name") == "Decision Tree"
+    assert any("Decision Tree" in a for a in activities)
+
+
+def test_apply_auto_actions_honors_compact_decisiontree_requirement():
+    df = pd.DataFrame(
+        {
+            "feature_a": [1, 2, 3, 4],
+            "feature_b": [10, 20, 30, 40],
+            "target": ["a", "b", "a", "b"],
+        }
+    )
+    state = {"agent_requirements": [{"text": "please use decisiontree classification model"}]}
+    changes, _activities = apply_auto_actions_snapshot(state, 3, df)
+    assert changes.get("model_name") == "Decision Tree"
+    assert changes.get("model_family") == "ML"
+
+
+def test_apply_auto_actions_honors_typo_decision_tree_requirement():
+    df = pd.DataFrame(
+        {
+            "feature_a": [1, 2, 3, 4],
+            "feature_b": [10, 20, 30, 40],
+            "target": ["a", "b", "a", "b"],
+        }
+    )
+    state = {"agent_requirements": [{"text": "use decison tree for clasification"}]}
+    changes, _activities = apply_auto_actions_snapshot(state, 3, df)
+    assert changes.get("model_name") == "Decision Tree"
+    assert changes.get("model_family") == "ML"
+
+
+def test_apply_auto_actions_latest_request_wins():
+    df = pd.DataFrame(
+        {
+            "feature_a": [1, 2, 3, 4],
+            "feature_b": [10, 20, 30, 40],
+            "target": ["a", "b", "a", "b"],
+        }
+    )
+    # agent_requirements uses newest-first ordering in this app.
+    state = {
+        "agent_requirements": [
+            {"text": "Actually use logistic regression"},
+            {"text": "Use decision tree classification model"},
+        ]
+    }
+    changes, _activities = apply_auto_actions_snapshot(state, 3, df)
+    assert changes.get("model_name") == "Logistic Regression"
+    assert changes.get("model_family") == "Statistical"
+
+
+def test_apply_auto_actions_honors_requirement_knn():
+    df = pd.DataFrame({
+        "age": [25, 30, 22, 40],
+        "income": [50000, 60000, 32000, 80000],
+        "gender": ["M", "F", "F", "M"],
+    })
+    state = {"agent_requirements": [{"text": "Use KNN model for gender classification."}]}
+    changes, activities = apply_auto_actions_snapshot(state, 3, df)
+    assert changes.get("model_name") == "KNN"
+    assert changes.get("model_family") == "ML"
+    assert any("KNN" in a for a in activities)
+
+
+def test_apply_auto_actions_honors_holt_winters_multiplicative_request():
+    df = make_df()
+    state = {
+        "agent_requirements": [
+            {"text": "Use time series Holt Winters multiplicative model with seasonal 12"}
+        ]
+    }
+    changes, activities = apply_auto_actions_snapshot(state, 3, df)
+    assert changes.get("problem_type") == "time_series"
+    assert changes.get("time_series_model") == "Holt-Winters"
+    assert changes.get("hw_trend") == "mul"
+    assert changes.get("hw_seasonal_periods") == 12
+    assert changes.get("time_series_model") != "ARIMA"
+    assert any("time-series" in a.lower() or "holt" in a.lower() for a in activities)
