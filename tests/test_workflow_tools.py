@@ -1,11 +1,18 @@
 import pandas as pd
 
 from ai_agent.workflow_tools import (
+    analyze_correlations,
+    analyze_heteroscedasticity,
+    analyze_multicollinearity,
+    analyze_normality,
     build_report_payload,
     build_workflow_profile,
+    collect_dataset_diagnostics,
     perform_eda,
     recommend_eda_actions,
     recommend_model_setup,
+    run_statistical_tools_on_demand,
+    should_run_statistical_tools,
 )
 
 
@@ -58,8 +65,72 @@ def test_perform_eda_includes_stationarity_for_time_series():
     result = perform_eda(df, target_col="target")
     assert result["problem_type"] == "time_series"
     assert "stationarity" in result
+    assert "correlation_analysis" in result
     assert "recommended_sections" in result
     assert "acf_pacf" in result["recommended_sections"]
+
+
+def test_analyze_correlations_returns_sorted_top_pairs():
+    df = pd.DataFrame(
+        {
+            "x": [1, 2, 3, 4, 5],
+            "y": [2, 4, 6, 8, 10],
+            "z": [5, 4, 3, 2, 1],
+        }
+    )
+    corr = analyze_correlations(df, top_k=2)
+    assert corr["is_applicable"] is True
+    assert len(corr["top_pairs"]) == 2
+    assert corr["top_pairs"][0]["abs_corr"] >= corr["top_pairs"][1]["abs_corr"]
+
+
+def test_collect_dataset_diagnostics_includes_tool_outputs():
+    df = pd.DataFrame(
+        {
+            "time": pd.date_range("2024-01-01", periods=20, freq="D"),
+            "target": list(range(20)),
+            "feature": list(range(20, 0, -1)),
+        }
+    )
+    diagnostics = collect_dataset_diagnostics(df, target_col="target")
+    assert "eda" in diagnostics
+    assert "stationarity" in diagnostics
+    assert "correlation_analysis" in diagnostics
+    assert "model_setup" in diagnostics
+
+
+def test_statistical_tools_trigger_and_run_on_demand():
+    df = pd.DataFrame(
+        {
+            "x1": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            "x2": [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],
+            "target": [1.0, 1.8, 3.2, 3.9, 5.1, 5.9, 7.3, 8.1, 8.8, 10.2, 11.1, 12.0],
+        }
+    )
+    assert should_run_statistical_tools("run normality and VIF checks") is True
+    assert should_run_statistical_tools("hello there") is False
+    result = run_statistical_tools_on_demand(df, user_text="check stationarity and correlation", target_col="target")
+    assert "stationarity_analysis" in result
+    assert "correlation_analysis" in result
+    assert "normality_analysis" in result
+    assert "multicollinearity_analysis" in result
+    assert "heteroscedasticity_analysis" in result
+
+
+def test_statistical_tools_base_functions_return_structured_payloads():
+    df = pd.DataFrame(
+        {
+            "x1": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "x2": [2, 1, 4, 3, 6, 5, 8, 7, 10, 9],
+            "target": [1.1, 1.9, 3.2, 3.8, 5.2, 5.8, 7.1, 8.2, 8.9, 10.0],
+        }
+    )
+    normality = analyze_normality(df)
+    vif = analyze_multicollinearity(df)
+    hetero = analyze_heteroscedasticity(df, target_col="target")
+    assert "results" in normality
+    assert "vif" in vif
+    assert "pvalue" in hetero
 
 
 def test_recommend_model_setup_prefers_supported_defaults():

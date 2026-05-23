@@ -74,8 +74,10 @@ def test_auto_mode_prompt_prioritizes_user_request_and_kb():
 	assert "show only missingness" in prompt
 
 
-def test_call_groq_falls_back_to_reviewer_on_rate_limit(monkeypatch):
+def test_call_groq_falls_back_to_family_backup_on_rate_limit(monkeypatch):
 	from ai_agent import llm_client
+
+	attempts = []
 
 	class DummyResponse:
 		def __init__(self, content):
@@ -83,18 +85,89 @@ def test_call_groq_falls_back_to_reviewer_on_rate_limit(monkeypatch):
 
 	class DummyGroq:
 		def __init__(self, api_key, model, temperature, max_tokens):
+			attempts.append((api_key, model))
 			self.model = model
 		def invoke(self, messages):
-			if self.model == DEFAULT_REASONER_MODEL:
+			if self.model == "reasoner-primary":
 				raise RuntimeError("429 rate limit exceeded")
-			if self.model == DEFAULT_REVIEWER_MODEL:
-				return DummyResponse("backup ok")
-			raise RuntimeError("model unavailable")
+			if self.model == "reasoner-backup":
+				raise RuntimeError("429 rate limit exceeded")
+			return DummyResponse("backup ok")
 
-	monkeypatch.setenv("GROQ_API_KEY", "test-key")
+	monkeypatch.setattr(
+		llm_client,
+		"MODEL_FALLBACKS",
+		{"reasoner-primary": ["reasoner-primary", "reviewer-backup", "router-backup"]},
+	)
+	monkeypatch.setenv("GROQ_API_KEY", "primary-key")
+	monkeypatch.setenv("GROQ_API_KEY_BACKUP", "backup-key")
 	monkeypatch.setattr(llm_client, "ChatGroq", DummyGroq)
-	result = call_groq("test prompt", task_type="reasoning", force_model=DEFAULT_REASONER_MODEL)
+	result = call_groq("test prompt", task_type="reasoning", force_model="reasoner-primary")
 	assert result == "backup ok"
+	assert attempts == [("primary-key", "reasoner-primary"), ("backup-key", "reviewer-backup")]
+
+
+def test_call_groq_uses_backup_model_and_backup_key(monkeypatch):
+	from ai_agent import llm_client
+
+	attempts = []
+
+	class DummyResponse:
+		def __init__(self, content):
+			self.content = content
+
+	class DummyGroq:
+		def __init__(self, api_key, model, temperature, max_tokens):
+			attempts.append((api_key, model))
+			self.api_key = api_key
+			self.model = model
+		def invoke(self, messages):
+			if self.model == "router-primary":
+				raise RuntimeError("429 rate limit exceeded")
+			if self.model == "reasoner-backup":
+				raise RuntimeError("429 rate limit exceeded")
+			return DummyResponse("backup ok")
+
+	monkeypatch.setattr(
+		llm_client,
+		"MODEL_FALLBACKS",
+		{"router-primary": ["router-primary", "reasoner-backup", "reviewer-backup"]},
+	)
+	monkeypatch.setenv("GROQ_API_KEY", "primary-key")
+	monkeypatch.setenv("GROQ_API_KEY_BACKUP", "backup-key")
+	monkeypatch.setattr(llm_client, "ChatGroq", DummyGroq)
+
+	result = call_groq("test prompt", task_type="intent", force_model="router-primary")
+
+	assert result == "backup ok"
+	assert attempts == [("primary-key", "router-primary"), ("backup-key", "reasoner-backup"), ("backup-key", "reviewer-backup")]
+
+
+def test_call_groq_converts_route_label_to_real_model(monkeypatch):
+	from ai_agent import llm_client
+
+	attempts = []
+
+	class DummyResponse:
+		def __init__(self, content):
+			self.content = content
+
+	class DummyGroq:
+		def __init__(self, api_key, model, temperature, max_tokens):
+			attempts.append((api_key, model))
+			self.model = model
+		def invoke(self, messages):
+			return DummyResponse("label ok")
+
+	monkeypatch.setattr(llm_client, "DEFAULT_ROUTER_MODEL", "router-primary")
+	monkeypatch.setenv("GROQ_API_KEY", "primary-key")
+	monkeypatch.setenv("GROQ_API_KEY_BACKUP", "backup-key")
+	monkeypatch.setattr(llm_client, "ChatGroq", DummyGroq)
+
+	result = call_groq("test prompt", task_type="chat", force_model="reasoner")
+
+	assert result == "label ok"
+	assert attempts == [("primary-key", DEFAULT_REASONER_MODEL)]
 
 
 def test_build_workflow_rag_context_uses_step_aware_top_k(monkeypatch):

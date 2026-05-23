@@ -19,7 +19,7 @@ def build_rag_context_text(query: str, top_k: int = 3) -> str:
 
 
 def build_workflow_rag_query(step: int, user_goal: str = "", column_text: str = "", summary_text: str = "") -> str:
-	parts = ["System Adaptation Protocol"]
+	parts = ["System Adaptation Protocol", "Human Interaction Protocol", "greeting", "requirement handling", "irrelevant request refusal"]
 	if step == 1:
 		parts.extend(["EDA Selection Logic", "system adaptation usage", "missingness", "target relationships", "outliers"])
 	elif step == 2:

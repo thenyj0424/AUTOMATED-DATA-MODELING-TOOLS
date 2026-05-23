@@ -4,6 +4,7 @@ import pandas as pd
 from ai_agent.data_utils import impute_missing_values, build_summary, count_iqr_outliers
 from ai_agent.llm_client import call_groq, groq_token_loaded, DEFAULT_REASONER_MODEL
 from ai_agent.rag_store import build_workflow_rag_context
+from ai_agent.copilot_utils import infer_time_series_configuration
 from ai_agent.config import (
     STATISTICAL_CLASSIFICATION_MODELS,
     STATISTICAL_REGRESSION_MODELS,
@@ -230,43 +231,15 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
                         req_texts.append(str(r))
                 except Exception:
                     continue
-            req_blob_local = " ".join(req_texts).lower()
             explicit_model: Optional[str] = None
             explicit_family: Optional[str] = None
             explicit_time_series_changes: Dict[str, Any] = {}
-            has_time_series_request = any(token in req_blob_local for token in [
-                "time series",
-                "timeseries",
-                "forecast",
-                "arima",
-                "sarima",
-                "holt",
-                "winters",
-            ])
-            if has_time_series_request:
-                explicit_time_series_changes["problem_type"] = "time_series"
-                if "holt" in req_blob_local or "winters" in req_blob_local:
-                    explicit_time_series_changes["time_series_model"] = "Holt-Winters"
-                    if "multiplicative" in req_blob_local or "mul" in req_blob_local:
-                        explicit_time_series_changes["hw_trend"] = "mul"
-                    if "additive" in req_blob_local or "add" in req_blob_local:
-                        explicit_time_series_changes["hw_trend"] = "add"
-                    if "seasonal 12" in req_blob_local or "seasonality 12" in req_blob_local or "period 12" in req_blob_local or "m=12" in req_blob_local:
-                        explicit_time_series_changes["hw_seasonal_periods"] = 12
-                elif "sarima" in req_blob_local:
-                    explicit_time_series_changes["time_series_model"] = "SARIMA"
-                    if "auto arima" in req_blob_local:
-                        explicit_time_series_changes["time_series_mode"] = "Auto ARIMA"
-                    elif "manual" in req_blob_local:
-                        explicit_time_series_changes["time_series_mode"] = "Manual"
-                    if "seasonal 12" in req_blob_local or "seasonality 12" in req_blob_local or "period 12" in req_blob_local or "m=12" in req_blob_local:
-                        explicit_time_series_changes["sarima_m"] = 12
-                elif "arima" in req_blob_local:
-                    explicit_time_series_changes["time_series_model"] = "ARIMA"
-                    if "auto" in req_blob_local:
-                        explicit_time_series_changes["time_series_mode"] = "Auto ARIMA"
-                    elif "manual" in req_blob_local:
-                        explicit_time_series_changes["time_series_mode"] = "Manual"
+            for text in req_texts:
+                ts_changes = infer_time_series_configuration(text)
+                if ts_changes:
+                    explicit_time_series_changes = ts_changes
+                    break
+            has_time_series_request = bool(explicit_time_series_changes)
             explicit_model, explicit_family = _extract_explicit_model(req_texts)
 
             if explicit_model:
@@ -277,7 +250,19 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
             if explicit_time_series_changes:
                 ai_changes.update(explicit_time_series_changes)
                 ai_changes.setdefault("proceed_model", True)
-                ai_activities.append("Applied explicit user requirement for time-series configuration.")
+                ts_model = explicit_time_series_changes.get("time_series_model")
+                ts_trend = explicit_time_series_changes.get("hw_trend")
+                ts_seasonal = explicit_time_series_changes.get("hw_seasonal")
+                ts_parts = [f"Applied time-series configuration: {ts_model or 'default'}"]
+                if ts_trend:
+                    ts_parts.append(f"trend={ts_trend}")
+                if ts_seasonal:
+                    ts_parts.append(f"seasonal={ts_seasonal}")
+                if explicit_time_series_changes.get("hw_seasonal_periods"):
+                    ts_parts.append(f"seasonal_periods={explicit_time_series_changes['hw_seasonal_periods']}")
+                if explicit_time_series_changes.get("time_series_mode"):
+                    ts_parts.append(f"mode={explicit_time_series_changes['time_series_mode']}")
+                ai_activities.append("; ".join(ts_parts))
 
             # If no AI changes produced, enforce explicit requirements locally as fallback
             if not ai_changes:

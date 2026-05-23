@@ -23,6 +23,16 @@ def _pick_primary_metric(results: Dict[str, Any]) -> Tuple[str, Any]:
 	metric_label = results.get("metric_label")
 	baseline = results.get("baseline", {}) if isinstance(results, dict) else {}
 	metrics = baseline.get("metrics", {}) if isinstance(baseline, dict) else {}
+	if results.get("problem_type") == "time_series":
+		ts = results.get("time_series", {}) if isinstance(results, dict) else {}
+		metrics = ts.get("metrics", {}) if isinstance(ts, dict) else {}
+		for metric_name, metric_key in (("RMSE", "rmse"), ("MAE", "mae"), ("R2", "r2")):
+			if metric_key in metrics:
+				return metric_name, metrics.get(metric_key)
+		if metrics:
+			first_key = next(iter(metrics.keys()))
+			return str(first_key).upper(), metrics.get(first_key)
+		return "RMSE", None
 	if metric_label and metric_label in metrics:
 		return metric_label, metrics.get(metric_label)
 	if metrics:
@@ -51,6 +61,8 @@ def _extract_top_features(insights: Dict[str, Any], limit: int = 3) -> List[Tupl
 
 
 def _build_ai_insight_text(results: Dict[str, Any]) -> str:
+	if results.get("problem_type") == "time_series":
+		return _build_time_series_insight_text(results)
 	metric_name, metric_value = _pick_primary_metric(results)
 	insights = results.get("baseline_insights", {}) or {}
 	top_features = _extract_top_features(insights, limit=3)
@@ -61,6 +73,57 @@ def _build_ai_insight_text(results: Dict[str, Any]) -> str:
 	else:
 		feature_sentence = "The model insight view does not expose feature ranking for this run, so the strongest available signals are shown below."
 	return f"{metric_sentence} {feature_sentence}"
+
+
+def _build_time_series_metric_rows(ts: Dict[str, Any]) -> List[Tuple[str, Any]]:
+	metrics = ts.get("metrics", {}) if isinstance(ts, dict) else {}
+	rows: List[Tuple[str, Any]] = []
+	for metric_name in ("rmse", "mae", "r2"):
+		if metric_name in metrics:
+			rows.append((metric_name.upper(), metrics.get(metric_name)))
+	for key, value in metrics.items():
+		if str(key).lower() not in {"rmse", "mae", "r2"}:
+			rows.append((str(key).upper(), value))
+	return rows
+
+
+def _build_time_series_frame(ts: Dict[str, Any]) -> pd.DataFrame:
+	y_true = list(ts.get("y_true", []) or [])
+	preds = list(ts.get("preds", []) or [])
+	residuals = list(ts.get("residuals", []) or [])
+	row_count = min(len(y_true), len(preds))
+	frame = pd.DataFrame(
+		{
+			"row": list(range(1, row_count + 1)),
+			"actual": y_true[:row_count],
+			"predicted": preds[:row_count],
+		}
+	)
+	if residuals:
+		frame["residual"] = residuals[:row_count]
+	return frame
+
+
+def _build_time_series_insight_text(results: Dict[str, Any]) -> str:
+	ts = results.get("time_series", {}) if isinstance(results, dict) else {}
+	metric_rows = _build_time_series_metric_rows(ts)
+	model_details = ts.get("model_details", {}) if isinstance(ts, dict) else {}
+	parts: List[str] = []
+	if metric_rows:
+		parts.append(
+			"Forecast metrics: "
+			+ ", ".join(f"{name}={_format_metric_value(value)}" for name, value in metric_rows[:3])
+		)
+	if model_details:
+		compact_details = []
+		for key in ("trend", "seasonal", "seasonal_periods", "order", "seasonal_order", "selection"):
+			if key in model_details:
+				compact_details.append(f"{key}={model_details[key]}")
+		if compact_details:
+			parts.append("Model setup: " + "; ".join(compact_details))
+	if not parts:
+		return "The time-series forecast completed successfully."
+	return " ".join(parts)
 
 
 def _render_insights(insights: Dict[str, Any]) -> None:
@@ -212,29 +275,64 @@ def render_results_view(
 			except Exception as exc:
 				st.warning(f"AI insight not available. Check LLM configuration or the results context. ({exc})")
 
-	render_system_message("Results", summary)
-	show_predictions = st.checkbox("Show prediction vs actual", key="show_predictions", value=True)
 	problem_type = results.get("problem_type")
 
 	if problem_type == "time_series":
 		ts = results.get("time_series", {})
 		st.subheader("Time Series Results")
-		st.write(f"Model: {results.get('model_name')}")
-		if ts.get("model_details"):
-			st.subheader("Model Details")
-			st.json(ts["model_details"])
-		if ts.get("metrics"):
-			st.subheader("Metrics")
-			st.json(ts["metrics"])
+		st.caption(f"{results.get('model_name', '')} · {results.get('time_series_mode', '')}".strip(" ·"))
+		metric_name, metric_value = _pick_primary_metric(results)
+		header_cols = st.columns([1.0, 1.0, 1.2])
+		with header_cols[0]:
+			st.metric("Primary metric", metric_name, _format_metric_value(metric_value))
+		with header_cols[1]:
+			st.metric("Test points", len(ts.get("y_true", []) or []))
+		with header_cols[2]:
+			st.metric("Forecast points", len(ts.get("preds", []) or []))
+
+		st.markdown("### Forecast summary")
+		st.info(_build_time_series_insight_text(results))
+
+		metric_rows = _build_time_series_metric_rows(ts)
+		if metric_rows:
+			st.markdown("### Metrics")
+			metric_cols = st.columns(min(3, len(metric_rows)))
+			for idx, (name, value) in enumerate(metric_rows[:3]):
+				with metric_cols[idx]:
+					st.metric(name, _format_metric_value(value))
+
+		model_details = ts.get("model_details", {})
+		if model_details:
+			st.markdown("### Model Setup")
+			setup_cols = st.columns(2)
+			with setup_cols[0]:
+				st.json(model_details)
+			with setup_cols[1]:
+				st.write("Selected model:")
+				st.write(results.get("model_name", ""))
+
+		forecast_frame = _build_time_series_frame(ts)
+		if not forecast_frame.empty:
+			st.markdown("### Forecast Table")
+			st.dataframe(forecast_frame, use_container_width=True, hide_index=True)
+			st.download_button(
+				"Download forecast table (CSV)",
+				forecast_frame.to_csv(index=False),
+				file_name="time_series_forecast.csv",
+			)
+
 		if show_predictions and ts.get("y_true") and ts.get("preds"):
-			st.subheader("Actual vs Predicted (Test)")
-			fig, ax = plt.subplots(figsize=(8, 4))
-			ax.plot(ts["y_true"], label="Actual")
-			ax.plot(ts["preds"], label="Predicted")
+			st.markdown("### Actual vs Predicted")
+			fig, ax = plt.subplots(figsize=(9, 4))
+			ax.plot(ts["y_true"], label="Actual", linewidth=2)
+			ax.plot(ts["preds"], label="Predicted", linewidth=2)
+			ax.set_xlabel("Test observation")
+			ax.set_ylabel("Target value")
 			ax.legend()
 			st.pyplot(fig, use_container_width=True)
+
 		if ts.get("residuals"):
-			st.subheader("Residual Checks")
+			st.markdown("### Residual Checks")
 			fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 			if len(ts.get("preds", [])) == len(ts.get("residuals", [])):
 				sns.scatterplot(x=ts["preds"], y=ts["residuals"], ax=axes[0])
@@ -246,6 +344,7 @@ def render_results_view(
 			sns.histplot(ts["residuals"], kde=True, ax=axes[1])
 			axes[1].set_title("Residual Distribution")
 			st.pyplot(fig, use_container_width=True)
+
 		col_a, col_b = st.columns([1, 1])
 		with col_a:
 			if st.button("Back"):

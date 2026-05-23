@@ -11,7 +11,12 @@ import streamlit as st
 
 from ai_agent.llm_client import call_groq, groq_token_loaded
 from ai_agent.rag_store import build_workflow_rag_context
-from ai_agent.workflow_tools import perform_eda
+from ai_agent.workflow_tools import (
+	collect_dataset_diagnostics,
+	perform_eda,
+	recommend_model_setup,
+	run_statistical_tools_on_demand,
+)
 
 
 def is_requirement_message(user_text: str) -> bool:
@@ -81,6 +86,156 @@ def condense_user_facing_text(text: str, max_sentences: int = 3, max_words: int 
 	return re.sub(r"\s+", " ", cleaned).strip()
 
 
+def is_short_acknowledgement(user_text: str) -> bool:
+	text = str(user_text or "").strip().lower()
+	if not text:
+		return False
+	compact = re.sub(r"[^a-z0-9\s]", "", text)
+	ack_tokens = {
+		"ok",
+		"okay",
+		"yes",
+		"y",
+		"sure",
+		"go ahead",
+		"sounds good",
+		"do it",
+		"proceed",
+		"continue",
+	}
+	return compact in ack_tokens
+
+
+def _extract_recommendation_from_reply(reply_text: str) -> str:
+	text = str(reply_text or "").strip()
+	if not text:
+		return ""
+	lower = text.lower()
+	model_tokens = [
+		"decision tree",
+		"random forest",
+		"gradient boosting",
+		"knn",
+		"svm",
+		"svr",
+		"logistic regression",
+		"linear regression",
+		"ridge",
+		"lasso",
+		"arima",
+		"sarima",
+		"holt-winters",
+	]
+	for token in model_tokens:
+		if token in lower:
+			return token
+	first_sentence = re.split(r"(?<=[.!?])\s+", text)[0]
+	return first_sentence[:180]
+
+
+def _normalize_request_text_local(text: str) -> str:
+	return str(text or "").lower().replace("-", " ").replace("_", " ")
+
+
+def _has_phrase(text: str, phrase: str) -> bool:
+	return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
+
+
+def infer_time_series_configuration(user_text: str) -> Dict[str, Any]:
+	text = _normalize_request_text_local(user_text)
+	if not text:
+		return {}
+	if not any(token in text for token in ["time series", "timeseries", "forecast", "arima", "sarima", "holt", "winters", "seasonal", "exponential smoothing"]):
+		return {}
+	config: Dict[str, Any] = {"problem_type": "time_series"}
+	if _has_phrase(text, "sarima"):
+		config["time_series_model"] = "SARIMA"
+		if _has_phrase(text, "auto arima") or _has_phrase(text, "auto"):
+			config["time_series_mode"] = "Auto ARIMA"
+		elif _has_phrase(text, "manual"):
+			config["time_series_mode"] = "Manual"
+		if any(token in text for token in ["seasonal 12", "seasonality 12", "period 12", "m=12"]):
+			config["sarima_m"] = 12
+		return config
+	if _has_phrase(text, "arima"):
+		config["time_series_model"] = "ARIMA"
+		if _has_phrase(text, "auto arima") or _has_phrase(text, "auto"):
+			config["time_series_mode"] = "Auto ARIMA"
+		elif _has_phrase(text, "manual"):
+			config["time_series_mode"] = "Manual"
+		return config
+
+	config["time_series_model"] = "Holt-Winters"
+	trend = None
+	seasonal = None
+	if _has_phrase(text, "trend multiplicative") or _has_phrase(text, "multiplicative trend") or _has_phrase(text, "trend mul"):
+		trend = "mul"
+	elif _has_phrase(text, "trend additive") or _has_phrase(text, "additive trend") or _has_phrase(text, "trend add"):
+		trend = "add"
+	if _has_phrase(text, "seasonal multiplicative") or _has_phrase(text, "multiplicative seasonal") or _has_phrase(text, "seasonality multiplicative") or _has_phrase(text, "seasonal mul"):
+		seasonal = "mul"
+	elif _has_phrase(text, "seasonal additive") or _has_phrase(text, "additive seasonal") or _has_phrase(text, "seasonality additive") or _has_phrase(text, "seasonal add"):
+		seasonal = "add"
+	if trend is None and seasonal is None:
+		if _has_phrase(text, "multiplicative") or _has_phrase(text, "mul"):
+			trend = "mul"
+			seasonal = "mul"
+		elif _has_phrase(text, "additive") or _has_phrase(text, "add"):
+			trend = "add"
+			seasonal = "add"
+	if trend is None:
+		trend = "add"
+	if seasonal is None:
+		seasonal = "add"
+	config["hw_trend"] = trend
+	config["hw_seasonal"] = seasonal
+	if any(token in text for token in ["seasonal 12", "seasonality 12", "period 12", "m=12"]):
+		config["hw_seasonal_periods"] = 12
+	return config
+
+
+def update_conversation_memory_from_user(user_text: str) -> None:
+	memory = dict(st.session_state.get("agent_conversation_memory", {}) or {})
+	text = str(user_text or "").strip()
+	if not text:
+		st.session_state["agent_conversation_memory"] = memory
+		return
+	memory["last_user_text"] = text[:300]
+	memory["last_user_ack"] = bool(is_short_acknowledgement(text))
+	if memory.get("last_user_ack"):
+		memory["last_user_confirmation"] = text[:120]
+	memory["updated_at"] = datetime.now().isoformat()
+	st.session_state["agent_conversation_memory"] = memory
+
+
+def update_conversation_memory_from_assistant(reply_text: str) -> None:
+	memory = dict(st.session_state.get("agent_conversation_memory", {}) or {})
+	text = str(reply_text or "").strip()
+	if not text:
+		st.session_state["agent_conversation_memory"] = memory
+		return
+	memory["last_assistant_reply"] = text[:500]
+	reco = _extract_recommendation_from_reply(text)
+	if reco:
+		memory["last_recommendation"] = reco
+	memory["updated_at"] = datetime.now().isoformat()
+	st.session_state["agent_conversation_memory"] = memory
+
+
+def format_conversation_memory_for_context(memory: Optional[Dict[str, Any]]) -> str:
+	data = memory or {}
+	parts: List[str] = []
+	if data.get("last_recommendation"):
+		parts.append(f"last_recommendation={data['last_recommendation']}")
+	if data.get("last_user_confirmation"):
+		parts.append(f"last_confirmation={data['last_user_confirmation']}")
+	if data.get("last_assistant_reply"):
+		parts.append(f"last_assistant_reply={str(data['last_assistant_reply'])[:160]}")
+	if not parts:
+		return ""
+	return " | ".join(parts)
+
+
 def is_meta_help_request(user_text: str) -> bool:
 	lower = str(user_text or "").strip().lower()
 	if not lower:
@@ -117,21 +272,21 @@ def apply_requirement_to_state(req_text: str) -> List[str]:
 	Returns a list of human-readable activity notes that were applied.
 	"""
 	notes: List[str] = []
-	def _normalize_request_text_local(text: str) -> str:
-		return str(text or "").lower().replace("-", " ").replace("_", " ")
-
 	txt = _normalize_request_text_local(req_text)
+	ts_config = infer_time_series_configuration(req_text)
 
 	# Time-series hints
-	if any(token in txt for token in ["time series", "timeseries", "forecast", "arima", "holt", "winters", "seasonal"]):
-		st.session_state["problem_type"] = "time_series"
+	if ts_config:
+		st.session_state.update(ts_config)
 		notes.append("Applied requirement: problem_type = time_series")
-		if "holt" in txt or "winters" in txt:
-			st.session_state["time_series_model"] = "Holt-Winters"
+		if ts_config.get("time_series_model") == "Holt-Winters":
 			notes.append("Applied requirement: time_series_model = Holt-Winters")
-		if "seasonal 12" in txt or "period 12" in txt or "m=12" in txt:
-			st.session_state["hw_seasonal_periods"] = 12
-			notes.append("Applied requirement: hw_seasonal_periods = 12")
+			if ts_config.get("hw_trend"):
+				notes.append(f"Applied requirement: hw_trend = {ts_config['hw_trend']}")
+			if ts_config.get("hw_seasonal"):
+				notes.append(f"Applied requirement: hw_seasonal = {ts_config['hw_seasonal']}")
+			if ts_config.get("hw_seasonal_periods") == 12:
+				notes.append("Applied requirement: hw_seasonal_periods = 12")
 
 	# Model family preferences as flexible hints — do not force a concrete family
 	if any(token in txt for token in ["ml", "machine learning", "random forest", "decision tree", "xgboost", "knn", "svm", "svr"]):
@@ -266,6 +421,57 @@ def add_chat_message(role: str, content: str) -> None:
 	st.session_state["agent_chat_messages"] = messages[-20:]
 
 
+def build_dataset_readiness_bundle(df: Optional[pd.DataFrame], summary: Any, target_col: Optional[str] = None) -> Dict[str, Any]:
+	if df is None or summary is None:
+		return {}
+	resolved_target_col = target_col or get_active_target_column()
+	diagnostics = collect_dataset_diagnostics(df, target_col=resolved_target_col)
+	eda = diagnostics.get("eda") or perform_eda(df, target_col=resolved_target_col)
+	model_setup = diagnostics.get("model_setup") or recommend_model_setup(df, target_col=resolved_target_col)
+	numeric_cols = list(getattr(summary, "numeric_cols", []) or [])
+	categorical_cols = list(getattr(summary, "categorical_cols", []) or [])
+	datetime_cols = list(getattr(summary, "datetime_cols", []) or [])
+	return {
+		"summary": {
+			"rows": getattr(summary, "rows", None),
+			"cols": getattr(summary, "cols", None),
+			"numeric_cols": numeric_cols,
+			"categorical_cols": categorical_cols,
+			"datetime_cols": datetime_cols,
+		},
+		"target_col": resolved_target_col,
+		"eda": eda,
+		"model_setup": model_setup,
+		"tool_outputs": {
+			"stationarity_analysis": diagnostics.get("stationarity"),
+			"correlation_analysis": diagnostics.get("correlation_analysis"),
+		},
+		"signals": {
+			"correlation_ready": len(numeric_cols) >= 2,
+			"pairplot_ready": 2 <= len(numeric_cols) <= 6 and getattr(summary, "cols", 0) <= 20,
+			"time_series_candidate": bool(datetime_cols),
+			"categorical_relationships_ready": bool(categorical_cols),
+		},
+		"high_level": {
+			"recommended_sections": eda.get("recommended_sections", []),
+			"problem_type": eda.get("problem_type"),
+			"model_family": model_setup.get("model_family"),
+			"model_name": model_setup.get("model_name"),
+			"reason": model_setup.get("reason"),
+		},
+	}
+
+
+def get_or_build_dataset_readiness_bundle(df: Optional[pd.DataFrame], summary: Any, target_col: Optional[str] = None) -> Dict[str, Any]:
+	bundle = st.session_state.get("dataset_readiness_bundle")
+	if isinstance(bundle, dict) and bundle.get("summary") and bundle.get("eda") and bundle.get("model_setup"):
+		return bundle
+	bundle = build_dataset_readiness_bundle(df, summary, target_col=target_col)
+	if bundle:
+		st.session_state["dataset_readiness_bundle"] = bundle
+	return bundle
+
+
 def build_rule_based_step_hint(step: int, df: Optional[pd.DataFrame], summary: Any) -> str:
 	if step == 0:
 		return "Upload your dataset, then click Continue to start AI-guided EDA."
@@ -289,6 +495,12 @@ def build_rule_based_step_hint(step: int, df: Optional[pd.DataFrame], summary: A
 
 def build_copilot_context(step: int, df: Optional[pd.DataFrame], summary: Any) -> str:
 	parts = [f"Step: {step}"]
+	warmup_context = st.session_state.get("rag_warmup_context")
+	if warmup_context:
+		parts.append(f"RAG warmup: {warmup_context}")
+	conversation_memory = format_conversation_memory_for_context(st.session_state.get("agent_conversation_memory"))
+	if conversation_memory:
+		parts.append(f"Conversation memory: {conversation_memory}")
 	# System policy: treat requirement-style chat messages as record-only.
 	parts.append(
 		"System policy: Auto AI records requirement-style chat messages and selects actions for the workflow."
@@ -299,6 +511,16 @@ def build_copilot_context(step: int, df: Optional[pd.DataFrame], summary: Any) -
 	current_goal = st.session_state.get("agent_goal")
 	if current_goal:
 		parts.append(f"Current user request: {current_goal}")
+	readiness_bundle = st.session_state.get("dataset_readiness_bundle")
+	if isinstance(readiness_bundle, dict) and readiness_bundle.get("high_level"):
+		high_level = readiness_bundle.get("high_level", {})
+		parts.append(
+			"Dataset readiness: "
+			f"problem_type={high_level.get('problem_type')}, "
+			f"model_family={high_level.get('model_family')}, "
+			f"model_name={high_level.get('model_name')}, "
+			f"signals={readiness_bundle.get('signals', {})}"
+		)
 	preference_text = format_preferences_for_context(st.session_state.get("agent_preferences"))
 	if preference_text:
 		parts.append(f"Stored user preferences: {preference_text}")
@@ -408,7 +630,10 @@ def build_dataset_analysis_context(
 	user_text: str,
 ) -> Dict[str, Any]:
 	target_col = get_active_target_column()
-	analysis = perform_eda(df, target_col=target_col)
+	bundle = get_or_build_dataset_readiness_bundle(df, summary, target_col=target_col)
+	analysis = bundle.get("eda") or perform_eda(df, target_col=target_col)
+	model_setup = bundle.get("model_setup") or recommend_model_setup(df, target_col=target_col)
+	on_demand_tools = run_statistical_tools_on_demand(df, user_text=user_text, target_col=target_col)
 	compact = {
 		"step": step,
 		"user_question": user_text,
@@ -418,10 +643,16 @@ def build_dataset_analysis_context(
 		"recommended_sections": analysis.get("recommended_sections", []),
 		"missingness": analysis.get("missingness", {}),
 		"stationarity": analysis.get("stationarity", {}),
+		"readiness": bundle.get("high_level", {}),
+		"signals": bundle.get("signals", {}),
+		"tool_outputs": {**bundle.get("tool_outputs", {}), **on_demand_tools},
+		"model_setup": model_setup,
 	}
 	return {
 		"target_col": target_col,
+		"bundle": bundle,
 		"analysis": analysis,
+		"on_demand_tools": on_demand_tools,
 		"prompt_context": json.dumps(compact, ensure_ascii=True, default=str),
 	}
 

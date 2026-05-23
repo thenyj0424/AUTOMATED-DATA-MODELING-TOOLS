@@ -175,6 +175,18 @@ def test_apply_auto_actions_honors_holt_winters_multiplicative_request():
     assert changes.get("problem_type") == "time_series"
     assert changes.get("time_series_model") == "Holt-Winters"
     assert changes.get("hw_trend") == "mul"
+    assert changes.get("hw_seasonal") == "mul"
     assert changes.get("hw_seasonal_periods") == 12
     assert changes.get("time_series_model") != "ARIMA"
     assert any("time-series" in a.lower() or "holt" in a.lower() for a in activities)
+
+
+def test_apply_auto_actions_defaults_vague_time_series_to_holt_winters():
+    df = make_df()
+    state = {"agent_requirements": [{"text": "Forecast this series"}]}
+    changes, activities = apply_auto_actions_snapshot(state, 3, df)
+    assert changes.get("problem_type") == "time_series"
+    assert changes.get("time_series_model") == "Holt-Winters"
+    assert changes.get("hw_trend") == "add"
+    assert changes.get("hw_seasonal") == "add"
+    assert any("holt" in a.lower() or "forecast" in a.lower() for a in activities)

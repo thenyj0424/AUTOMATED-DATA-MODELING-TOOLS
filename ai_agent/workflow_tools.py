@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 from langchain_core.tools import tool
+from scipy.stats import jarque_bera, shapiro, spearmanr
 from statsmodels.tsa.stattools import adfuller
 
 from ai_agent.data_utils import build_summary
@@ -111,6 +113,213 @@ def analyze_stationarity(df: pd.DataFrame, target_col: Optional[str] = None) -> 
         }
 
 
+def analyze_correlations(df: pd.DataFrame, top_k: int = 8) -> Dict[str, Any]:
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    if len(numeric_cols) < 2:
+        return {
+            "is_applicable": False,
+            "reason": "Need at least two numeric columns for correlation analysis.",
+            "top_pairs": [],
+            "numeric_cols": numeric_cols,
+        }
+    corr = df[numeric_cols].corr(numeric_only=True).abs()
+    pairs: List[Dict[str, Any]] = []
+    for i, col_a in enumerate(numeric_cols):
+        for col_b in numeric_cols[i + 1 :]:
+            value = corr.loc[col_a, col_b]
+            if pd.isna(value):
+                continue
+            pairs.append({"feature_a": col_a, "feature_b": col_b, "abs_corr": round(float(value), 6)})
+    pairs.sort(key=lambda item: item["abs_corr"], reverse=True)
+    return {
+        "is_applicable": True,
+        "numeric_cols": numeric_cols,
+        "top_pairs": pairs[:max(1, top_k)],
+        "strong_pairs": [item for item in pairs if item["abs_corr"] >= 0.7][:max(1, top_k)],
+    }
+
+
+def analyze_normality(df: pd.DataFrame, max_columns: int = 8) -> Dict[str, Any]:
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()[:max(1, max_columns)]
+    if not numeric_cols:
+        return {
+            "is_applicable": False,
+            "reason": "No numeric columns available for normality testing.",
+            "results": [],
+        }
+    results: List[Dict[str, Any]] = []
+    for col in numeric_cols:
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(series) < 8:
+            results.append({
+                "column": col,
+                "is_applicable": False,
+                "reason": "Not enough observations for normality tests.",
+            })
+            continue
+        sample = series.sample(n=min(5000, len(series)), random_state=42) if len(series) > 5000 else series
+        try:
+            shapiro_stat, shapiro_p = shapiro(sample)
+            jb_stat, jb_p = jarque_bera(sample)
+            results.append(
+                {
+                    "column": col,
+                    "is_applicable": True,
+                    "shapiro_pvalue": round(float(shapiro_p), 6),
+                    "jarque_bera_pvalue": round(float(jb_p), 6),
+                    "looks_normal": bool(shapiro_p > 0.05 and jb_p > 0.05),
+                }
+            )
+        except Exception as exc:
+            results.append({
+                "column": col,
+                "is_applicable": False,
+                "reason": f"Normality test failed: {exc}",
+            })
+    return {
+        "is_applicable": True,
+        "tested_columns": numeric_cols,
+        "results": results,
+    }
+
+
+def analyze_multicollinearity(df: pd.DataFrame, max_features: int = 12) -> Dict[str, Any]:
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()[:max(2, max_features)]
+    if len(numeric_cols) < 2:
+        return {
+            "is_applicable": False,
+            "reason": "Need at least two numeric features for VIF analysis.",
+            "vif": [],
+        }
+    frame = df[numeric_cols].replace([np.inf, -np.inf], np.nan).dropna()
+    if len(frame) < max(8, len(numeric_cols) + 1):
+        return {
+            "is_applicable": False,
+            "reason": "Not enough complete rows for VIF analysis.",
+            "vif": [],
+        }
+    try:
+        vif_rows: List[Dict[str, Any]] = []
+        values = frame.values.astype(float)
+        for idx, col in enumerate(frame.columns):
+            y = values[:, idx]
+            X_other = np.delete(values, idx, axis=1)
+            if X_other.shape[1] == 0:
+                continue
+            X_design = np.column_stack([np.ones(len(X_other)), X_other])
+            coeffs, _, _, _ = np.linalg.lstsq(X_design, y, rcond=None)
+            y_hat = X_design @ coeffs
+            ss_res = float(np.sum((y - y_hat) ** 2))
+            ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+            if ss_tot <= 0:
+                vif_value = float("inf")
+            else:
+                r2 = max(0.0, min(0.999999, 1.0 - (ss_res / ss_tot)))
+                vif_value = 1.0 / (1.0 - r2)
+            vif_rows.append({"feature": col, "vif": round(float(vif_value), 6), "high_vif": bool(vif_value >= 10.0)})
+        vif_rows.sort(key=lambda item: item["vif"], reverse=True)
+        return {
+            "is_applicable": True,
+            "vif": vif_rows,
+            "high_vif_features": [row["feature"] for row in vif_rows if row["high_vif"]],
+        }
+    except Exception as exc:
+        return {
+            "is_applicable": False,
+            "reason": f"VIF analysis failed: {exc}",
+            "vif": [],
+        }
+
+
+def analyze_heteroscedasticity(df: pd.DataFrame, target_col: Optional[str] = None, max_features: int = 8) -> Dict[str, Any]:
+    if not target_col or target_col not in df.columns:
+        return {
+            "is_applicable": False,
+            "reason": "No valid numeric target supplied for heteroscedasticity testing.",
+            "pvalue": None,
+        }
+    target_series = pd.to_numeric(df[target_col], errors="coerce")
+    if not pd.api.types.is_numeric_dtype(target_series):
+        return {
+            "is_applicable": False,
+            "reason": "Target must be numeric for heteroscedasticity testing.",
+            "pvalue": None,
+        }
+    candidate_features = [
+        col for col in df.select_dtypes(include=["number"]).columns.tolist()
+        if col != target_col
+    ][:max(1, max_features)]
+    if not candidate_features:
+        return {
+            "is_applicable": False,
+            "reason": "Need at least one numeric predictor for heteroscedasticity testing.",
+            "pvalue": None,
+        }
+    frame = pd.DataFrame({"target": target_series, **{c: pd.to_numeric(df[c], errors="coerce") for c in candidate_features}}).dropna()
+    if len(frame) < max(20, len(candidate_features) + 5):
+        return {
+            "is_applicable": False,
+            "reason": "Not enough complete rows for heteroscedasticity testing.",
+            "pvalue": None,
+        }
+    try:
+        y = frame["target"].to_numpy(dtype=float)
+        X = frame[candidate_features].to_numpy(dtype=float)
+        X_design = np.column_stack([np.ones(len(X)), X])
+        coeffs, _, _, _ = np.linalg.lstsq(X_design, y, rcond=None)
+        y_hat = X_design @ coeffs
+        residual_abs = np.abs(y - y_hat)
+        statistic, pvalue = spearmanr(y_hat, residual_abs)
+        pvalue = float(pvalue) if pvalue is not None and not np.isnan(pvalue) else 1.0
+        return {
+            "is_applicable": True,
+            "test": "Spearman(abs_residual, fitted)",
+            "pvalue": round(pvalue, 6),
+            "is_heteroscedastic": bool(pvalue <= 0.05),
+            "recommendation": "Use robust errors or transform features" if pvalue <= 0.05 else "No strong heteroscedasticity signal",
+        }
+    except Exception as exc:
+        return {
+            "is_applicable": False,
+            "reason": f"Heteroscedasticity test failed: {exc}",
+            "pvalue": None,
+        }
+
+
+def should_run_statistical_tools(user_text: str) -> bool:
+    text = str(user_text or "").lower()
+    if not text:
+        return False
+    tokens = [
+        "stationarity",
+        "adf",
+        "correlation",
+        "normality",
+        "shapiro",
+        "jarque",
+        "vif",
+        "multicollinearity",
+        "collinearity",
+        "heteroscedastic",
+        "breusch",
+        "statistical test",
+        "hypothesis test",
+    ]
+    return any(token in text for token in tokens)
+
+
+def run_statistical_tools_on_demand(df: pd.DataFrame, user_text: str, target_col: Optional[str] = None) -> Dict[str, Any]:
+    if not should_run_statistical_tools(user_text):
+        return {}
+    return {
+        "stationarity_analysis": analyze_stationarity(df, target_col=target_col),
+        "correlation_analysis": analyze_correlations(df),
+        "normality_analysis": analyze_normality(df),
+        "multicollinearity_analysis": analyze_multicollinearity(df),
+        "heteroscedasticity_analysis": analyze_heteroscedasticity(df, target_col=target_col),
+    }
+
+
 def recommend_eda_actions(df: pd.DataFrame, target_col: Optional[str] = None) -> Dict[str, Any]:
     profile = build_workflow_profile(df, target_col=target_col)
     problem_type = _infer_target_problem_type(df, target_col, profile.problem_type)
@@ -154,9 +363,19 @@ def perform_eda(df: pd.DataFrame, target_col: Optional[str] = None) -> Dict[str,
         },
         "missingness": summarize_missingness(df),
         "stationarity": eda_plan["stationarity"],
+        "correlation_analysis": analyze_correlations(df),
         "recommended_sections": eda_plan["recommended_sections"],
         "problem_type": eda_plan["problem_type"],
         "target_col": target_col,
+    }
+
+
+def collect_dataset_diagnostics(df: pd.DataFrame, target_col: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "eda": perform_eda(df, target_col=target_col),
+        "stationarity": analyze_stationarity(df, target_col=target_col),
+        "correlation_analysis": analyze_correlations(df),
+        "model_setup": recommend_model_setup(df, target_col=target_col),
     }
 
 
@@ -232,6 +451,30 @@ def perform_eda_tool(profile_json: str) -> str:
 @tool("stationarity_analysis")
 def stationarity_analysis_tool(profile_json: str) -> str:
     """Return a stationarity analysis payload in compact JSON."""
+    return profile_json
+
+
+@tool("correlation_analysis")
+def correlation_analysis_tool(profile_json: str) -> str:
+    """Return a correlation analysis payload in compact JSON."""
+    return profile_json
+
+
+@tool("normality_analysis")
+def normality_analysis_tool(profile_json: str) -> str:
+    """Return a normality analysis payload in compact JSON."""
+    return profile_json
+
+
+@tool("multicollinearity_analysis")
+def multicollinearity_analysis_tool(profile_json: str) -> str:
+    """Return a multicollinearity (VIF) analysis payload in compact JSON."""
+    return profile_json
+
+
+@tool("heteroscedasticity_analysis")
+def heteroscedasticity_analysis_tool(profile_json: str) -> str:
+    """Return a heteroscedasticity analysis payload in compact JSON."""
     return profile_json
 @tool("eda_recommendation")
 def eda_recommendation_tool(profile_json: str) -> str:

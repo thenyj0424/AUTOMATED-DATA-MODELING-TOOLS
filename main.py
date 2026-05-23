@@ -17,6 +17,9 @@ from dotenv import load_dotenv
 from sklearn.model_selection import train_test_split
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
+BASE_DIR = os.path.dirname(__file__)
+load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
+
 from ai_agent.config import (
 	APP_TITLE,
 	STATISTICAL_CLASSIFICATION_MODELS,
@@ -85,12 +88,15 @@ from ai_agent.tuning import run_tuning, is_optuna_available
 from ai_agent.results_view import render_results_view
 from ai_agent.copilot_utils import (
 	build_copilot_context,
+	build_dataset_readiness_bundle,
 	build_meta_help_reply,
 	build_dataset_analysis_context,
 	condense_user_facing_text,
 	sanitize_user_facing_text,
 	strip_internal_plan_payload,
 	summarize_results_for_ai,
+	update_conversation_memory_from_assistant,
+	update_conversation_memory_from_user,
 	update_preferences_from_text,
 	format_preferences_for_context,
 	is_meta_help_request,
@@ -98,9 +104,6 @@ from ai_agent.copilot_utils import (
 	is_dataset_question,
 )
 from ai_agent.rag_store import build_workflow_rag_context
-
-BASE_DIR = os.path.dirname(__file__)
-load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
 
 def init_state() -> None:
@@ -152,6 +155,10 @@ def init_state() -> None:
 		st.session_state["analysis_ready"] = False
 	if "analysis_ready_message" not in st.session_state:
 		st.session_state["analysis_ready_message"] = ""
+	if "dataset_readiness_bundle" not in st.session_state:
+		st.session_state["dataset_readiness_bundle"] = None
+	if "agent_conversation_memory" not in st.session_state:
+		st.session_state["agent_conversation_memory"] = {}
 	if "agent_undo_stack" not in st.session_state:
 		st.session_state["agent_undo_stack"] = []
 	if "agent_request_undo" not in st.session_state:
@@ -160,6 +167,12 @@ def init_state() -> None:
 		st.session_state["agent_request_revert_all"] = False
 	if "agent_request_revert_index" not in st.session_state:
 		st.session_state["agent_request_revert_index"] = None
+	if "rag_warmup_context" not in st.session_state:
+		st.session_state["rag_warmup_context"] = build_workflow_rag_context(
+			0,
+			user_goal="greeting requirement handling irrelevant request refusal human interaction",
+			top_k=4,
+		)
 
 
 def clear_workflow_state(keep_original: bool = True) -> None:
@@ -181,13 +194,70 @@ def clear_workflow_state(keep_original: bool = True) -> None:
 		"step4_state",
 		"analysis_ready",
 		"analysis_ready_message",
+		"dataset_readiness_bundle",
+		"agent_goal",
+		"agent_requirements",
+		"agent_chat_messages",
+		"agent_step_autorun",
+		"agent_auto_last_applied",
+		"agent_last_outcome",
+		"agent_conversation_memory",
 		"agent_preferences",
 		"agent_preference_notes",
 		"agent_preference_last_update",
+		"chat_dock_input",
+		"requirement_text",
 	]
 	if not keep_original:
 		keys_to_clear.append("df_original")
 		keys_to_clear.append("df_cleaned")
+	step3_widget_keys = [
+		"target_col",
+		"target_missing",
+		"problem_type",
+		"use_modeling",
+		"model_reco",
+		"time_col",
+		"time_series_model",
+		"time_series_mode",
+		"arima_p",
+		"arima_d",
+		"arima_q",
+		"sarima_P",
+		"sarima_D",
+		"sarima_Q",
+		"sarima_m",
+		"hw_trend",
+		"hw_seasonal",
+		"hw_seasonal_periods",
+		"model_family",
+		"model_name",
+		"metric_label",
+		"proceed_model",
+		"max_rows_value",
+		"max_rows_slider",
+		"max_rows_number",
+		"selected_features",
+		"confirm_features",
+		"feature_warning",
+		"feature_warning_signature",
+		"feature_selection",
+		"stepwise_direction",
+		"model_based",
+		"max_features_value",
+		"max_features_slider",
+		"max_features_number",
+		"tuning_method",
+		"cv_folds_value",
+		"cv_folds_slider",
+		"cv_folds_number",
+		"tpe_trials_value",
+		"tpe_trials_slider",
+		"tpe_trials_number",
+		"manual_params",
+		"show_predictions",
+	]
+	keys_to_clear.extend(step3_widget_keys)
 	for key in keys_to_clear:
 		if key in st.session_state:
 			del st.session_state[key]
@@ -426,6 +496,7 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 			if not user_text:
 				st.warning("Please enter a message before sending.")
 			else:
+				update_conversation_memory_from_user(user_text)
 				add_chat_message("user", user_text)
 				st.session_state["agent_goal"] = user_text
 				updated_preferences, preference_updates = update_preferences_from_text(
@@ -446,7 +517,9 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 						reqs = st.session_state.get("agent_requirements", [])
 						reqs.insert(0, {"text": user_text, "time": datetime.now().isoformat()})
 						st.session_state["agent_requirements"] = reqs[:50]
-						add_chat_message("assistant", "Noted. Requirement recorded.")
+						requirement_reply = "Noted. Requirement recorded."
+						add_chat_message("assistant", requirement_reply)
+						update_conversation_memory_from_assistant(requirement_reply)
 						# Parse and apply the requirement to session state so subsequent choices honor it.
 						from ai_agent.copilot_utils import apply_requirement_to_state
 						applied_notes = apply_requirement_to_state(user_text)
@@ -490,8 +563,8 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 									f"Current workflow context:\n{context}\n\n"
 									f"User request to follow:\n{user_text}"
 								)
-								route_model = classify_task_route(user_text, context)
-								reply = call_groq(prompt, max_new_tokens=180, task_type="chat", context=context, force_model=route_model) or ""
+								selected_model_name = classify_task_route(user_text, context)
+								reply = call_groq(prompt, max_new_tokens=180, task_type="chat", context=context, force_model=selected_model_name) or ""
 						if reply.startswith("ERROR:"):
 							add_agent_activity(reply, level="error")
 							reply = (
@@ -502,9 +575,12 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 							reply = build_rule_based_step_hint(step, df, summary)
 						reply = condense_user_facing_text(strip_internal_plan_payload(sanitize_user_facing_text(reply)))
 						add_chat_message("assistant", reply)
+						update_conversation_memory_from_assistant(reply)
 						add_agent_activity("Auto AI replied to chat.")
 				else:
-					add_chat_message("assistant", "LLM not configured. Set GROQ_API_KEY to enable responses.")
+					missing_llm_reply = "LLM not configured. Set GROQ_API_KEY to enable responses."
+					add_chat_message("assistant", missing_llm_reply)
+					update_conversation_memory_from_assistant(missing_llm_reply)
 					add_agent_activity("LLM not configured; no reply.", level="warn")
 
 		with conversation_slot:
@@ -1079,7 +1155,7 @@ def render_workflow_actions() -> None:
 		with col_right:
 			st.markdown("<div class='ui-workflow-item'>", unsafe_allow_html=True)
 			if st.button("↺ Reset", key="main_start_over", help="Start over"):
-				clear_workflow_state(keep_original=False)
+				clear_workflow_state()
 				st.session_state["step"] = 0
 				st.session_state["scroll_to_top"] = True
 				st.rerun()
@@ -1106,6 +1182,54 @@ def save_widget_state(bucket_key: str, keys: List[str]) -> None:
 		if key in st.session_state:
 			saved[key] = st.session_state[key]
 	st.session_state[bucket_key] = saved
+
+
+def _normalize_option_token(value: Any) -> str:
+	if value is None:
+		return "none"
+	text = str(value).strip().lower().replace("-", " ").replace("_", " ")
+	return " ".join(text.split())
+
+
+def normalize_selector_state(
+	key: str,
+	options: List[Any],
+	aliases: Optional[Dict[str, Any]] = None,
+	default: Optional[Any] = None,
+) -> None:
+	if key not in st.session_state:
+		return
+	if not options:
+		return
+	current_value = st.session_state.get(key)
+	if current_value in options:
+		return
+	option_map: Dict[str, Any] = {}
+	for option in options:
+		option_map[_normalize_option_token(option)] = option
+
+	alias_map: Dict[str, Any] = {}
+	for alias_key, alias_value in (aliases or {}).items():
+		norm_key = _normalize_option_token(alias_key)
+		if alias_value in options:
+			alias_map[norm_key] = alias_value
+		else:
+			mapped = option_map.get(_normalize_option_token(alias_value))
+			if mapped is not None:
+				alias_map[norm_key] = mapped
+
+	normalized_current = _normalize_option_token(current_value)
+	replacement = alias_map.get(normalized_current)
+	if replacement is None:
+		replacement = option_map.get(normalized_current)
+	if replacement is None:
+		replacement = default if default in options else options[0]
+
+	st.session_state[key] = replacement
+	add_agent_activity(
+		f"Invalid value '{current_value}' for {key} normalized to '{replacement}'.",
+		level="warn",
+	)
 
 
 def synced_slider_number(
@@ -1283,6 +1407,12 @@ def render_manual_tuning_controls(
 		)
 
 	if model_name in ["SVM", "SVR"]:
+		normalize_selector_state(
+			f"{prefix}manual_kernel",
+			["rbf", "linear"],
+			aliases={"radial": "rbf", "poly": "rbf"},
+			default="rbf",
+		)
 		kernel = st.selectbox(
 			"Kernel",
 			["rbf", "linear"],
@@ -1651,6 +1781,7 @@ def main() -> None:
 			st.session_state["df_original"] = df.copy()
 			st.session_state["df"] = df.copy()
 			st.session_state["summary"] = build_summary(df)
+			st.session_state["dataset_readiness_bundle"] = build_dataset_readiness_bundle(df, st.session_state["summary"])
 			st.session_state["df_cleaned"] = None
 			st.session_state["summary_cleaned"] = None
 			st.session_state["cleaning_applied"] = False
@@ -1977,6 +2108,7 @@ def main() -> None:
 			"sarima_Q",
 			"sarima_m",
 			"hw_trend",
+			"hw_seasonal",
 			"hw_seasonal_periods",
 			"model_family",
 			"model_name",
@@ -2024,7 +2156,9 @@ def main() -> None:
 		render_system_message("Modeling Setup", summary)
 
 		st.subheader("Problem Setup")
+		normalize_selector_state("target_col", list(df.columns), default=df.columns[0] if len(df.columns) else None)
 		target_col = st.selectbox("Target column", df.columns, key="target_col")
+		normalize_selector_state("target_missing", ["drop", "error (stop if missing)"], default="drop")
 		target_missing = st.selectbox(
 			"Target missing values",
 			["drop", "error (stop if missing)"],
@@ -2035,12 +2169,14 @@ def main() -> None:
 		problem_options = ["classification", "regression"]
 		if summary.datetime_cols:
 			problem_options.append("time_series")
+		normalize_selector_state("problem_type", problem_options, default=problem_options[0])
 		problem_type = st.selectbox("Problem type", problem_options, key="problem_type")
 
 		preferred_model_family = st.session_state.get("agent_preferences", {}).get("preferred_model_family")
 		if preferred_model_family in ["Statistical", "ML"] and "model_family" not in st.session_state:
 			st.session_state["model_family"] = preferred_model_family
 
+		normalize_selector_state("use_modeling", ["Yes", "No (EDA only)"], default="Yes")
 		use_modeling = st.radio(
 			"Do you want to build a model?",
 			["Yes", "No (EDA only)"],
@@ -2057,15 +2193,40 @@ def main() -> None:
 
 		if problem_type == "time_series":
 			st.info("Datetime columns detected. Time series analysis is available.")
+			normalize_selector_state("time_col", summary.datetime_cols, default=summary.datetime_cols[0] if summary.datetime_cols else None)
 			time_col = st.selectbox("Time column", summary.datetime_cols, key="time_col")
+			time_series_models = ["Holt-Winters", "ARIMA", "SARIMA"]
+			normalize_selector_state(
+				"time_series_model",
+				time_series_models,
+				aliases={
+					"holt_winters": "Holt-Winters",
+					"holt winters": "Holt-Winters",
+					"holt_winters_additive": "Holt-Winters",
+					"holt_winters_multiplicative": "Holt-Winters",
+					"holt winters additive": "Holt-Winters",
+					"holt winters multiplicative": "Holt-Winters",
+				},
+				default="Holt-Winters",
+			)
 			model_name = st.selectbox(
 				"Model",
-				["ARIMA", "SARIMA", "Holt-Winters"],
+				time_series_models,
 				key="time_series_model",
 			)
 
 			params: Dict[str, Any] = {}
 			if model_name in ["ARIMA", "SARIMA"]:
+				normalize_selector_state(
+					"time_series_mode",
+					["Auto ARIMA", "Manual"],
+					aliases={
+						"auto": "Auto ARIMA",
+						"auto_arima": "Auto ARIMA",
+						"manual_arima": "Manual",
+					},
+					default="Auto ARIMA",
+				)
 				time_series_mode = st.radio(
 					"ARIMA approach",
 					["Auto ARIMA", "Manual"],
@@ -2110,8 +2271,31 @@ def main() -> None:
 			else:
 				col_a, col_b = st.columns(2)
 				with col_a:
+					normalize_selector_state(
+						"hw_trend",
+						["add", "mul", None],
+						aliases={
+							"additive": "add",
+							"multiplicative": "mul",
+							"none": None,
+							"null": None,
+						},
+						default="add",
+					)
 					trend = st.selectbox("Trend", ["add", "mul", None], index=0, key="hw_trend")
 				with col_b:
+					normalize_selector_state(
+						"hw_seasonal",
+						["add", "mul"],
+						aliases={
+							"additive": "add",
+							"multiplicative": "mul",
+							"seasonal add": "add",
+							"seasonal mul": "mul",
+						},
+						default="add",
+					)
+					seasonal = st.selectbox("Seasonal", ["add", "mul"], index=0, key="hw_seasonal")
 					seasonal_periods = st.number_input(
 						"Seasonal periods",
 						min_value=2,
@@ -2120,7 +2304,7 @@ def main() -> None:
 						key="hw_seasonal_periods",
 					)
 				params["trend"] = trend
-				params["seasonal"] = "mul"
+				params["seasonal"] = seasonal
 				params["seasonal_periods"] = int(seasonal_periods)
 
 			if st.button("Run time series analysis"):
@@ -2234,13 +2418,23 @@ def main() -> None:
 				if model_family == "Statistical"
 				else ML_CLASSIFICATION_MODELS
 			)
-			# Ensure stored model_name is present in the current options; otherwise pick a safe default.
-			current_model = st.session_state.get("model_name")
-			if current_model and current_model not in model_options:
-				st.session_state["agent_activity"] = st.session_state.get("agent_activity", [])[:50]
-				st.session_state["agent_activity"].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "level": "warn", "message": f"Requested model '{current_model}' not valid for family '{model_family}'; defaulting to '{model_options[0]}'"})
-				st.session_state["model_name"] = model_options[0]
+			normalize_selector_state(
+				"model_name",
+				model_options,
+				aliases={
+					"decision_tree": "Decision Tree",
+					"random_forest": "Random Forest",
+					"gradient_boosting": "Gradient Boosting",
+					"k_nearest_neighbors": "KNN",
+					"k nearest neighbors": "KNN",
+					"knn_classifier": "KNN",
+					"support_vector_machine": "SVM",
+					"logistic": "Logistic Regression",
+				},
+				default=model_options[0],
+			)
 			model_name = st.selectbox("Model", model_options, key="model_name")
+			normalize_selector_state("metric_label", list(CLASSIFICATION_METRICS.keys()), default=list(CLASSIFICATION_METRICS.keys())[0])
 			metric_label = st.selectbox(
 				"Metric to optimize",
 				list(CLASSIFICATION_METRICS.keys()),
@@ -2253,12 +2447,23 @@ def main() -> None:
 				if model_family == "Statistical"
 				else ML_REGRESSION_MODELS
 			)
-			current_model = st.session_state.get("model_name")
-			if current_model and current_model not in model_options:
-				st.session_state["agent_activity"] = st.session_state.get("agent_activity", [])[:50]
-				st.session_state["agent_activity"].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "level": "warn", "message": f"Requested model '{current_model}' not valid for family '{model_family}'; defaulting to '{model_options[0]}'"})
-				st.session_state["model_name"] = model_options[0]
+			normalize_selector_state(
+				"model_name",
+				model_options,
+				aliases={
+					"decision_tree": "Decision Tree",
+					"random_forest": "Random Forest",
+					"gradient_boosting": "Gradient Boosting",
+					"k_nearest_neighbors": "KNN",
+					"k nearest neighbors": "KNN",
+					"knn_regressor": "KNN",
+					"support_vector_regression": "SVR",
+					"linear": "Linear Regression",
+				},
+				default=model_options[0],
+			)
 			model_name = st.selectbox("Model", model_options, key="model_name")
+			normalize_selector_state("metric_label", list(REGRESSION_METRICS.keys()), default=list(REGRESSION_METRICS.keys())[0])
 			metric_label = st.selectbox(
 				"Metric to optimize",
 				list(REGRESSION_METRICS.keys()),
@@ -2366,14 +2571,27 @@ def main() -> None:
 				if model_family == "Statistical"
 				else ["None", "RFE", "SelectKBest", "Model-based"]
 			)
-			current_feature_selection = st.session_state.get("feature_selection")
-			if current_feature_selection not in feature_methods:
-				st.session_state["feature_selection"] = feature_methods[0]
+			normalize_selector_state(
+				"feature_selection",
+				feature_methods,
+				aliases={
+					"select_k_best": "SelectKBest",
+					"selectkbest": "SelectKBest",
+					"model_based": "Model-based",
+				},
+				default=feature_methods[0],
+			)
 			feature_selection = st.selectbox("Method", feature_methods, key="feature_selection")
 			stepwise_direction = "forward"
 			model_based = "L1/Lasso"
 
 			if feature_selection == "Stepwise":
+				normalize_selector_state(
+					"stepwise_direction",
+					STEPWISE_DIRECTIONS,
+					aliases={"bi": "bidirectional", "both": "bidirectional"},
+					default="forward",
+				)
 				stepwise_direction = st.selectbox(
 					"Stepwise direction",
 					STEPWISE_DIRECTIONS,
@@ -2386,6 +2604,12 @@ def main() -> None:
 					st.warning("Stepwise selection is only supported for linear regression.")
 					feature_selection = "None"
 			if feature_selection == "Model-based":
+				normalize_selector_state(
+					"model_based",
+					MODEL_BASED_OPTIONS,
+					aliases={"lasso": "L1/Lasso", "tree": "Tree importance"},
+					default=MODEL_BASED_OPTIONS[0],
+				)
 				model_based = st.selectbox(
 					"Model-based selector",
 					MODEL_BASED_OPTIONS,
@@ -2412,8 +2636,17 @@ def main() -> None:
 				tuning_options = TUNING_METHODS
 				if "TPE (Optuna)" in tuning_options and not is_optuna_available():
 					tuning_options = [opt for opt in TUNING_METHODS if opt != "TPE (Optuna)"]
-				if current_tuning not in tuning_options:
-					st.session_state["tuning_method"] = "Grid Search" if "Grid Search" in tuning_options else tuning_options[0]
+				normalize_selector_state(
+					"tuning_method",
+					tuning_options,
+					aliases={
+						"grid": "Grid Search",
+						"manual tuning": "Manual",
+						"optuna": "TPE (Optuna)",
+						"none": "None",
+					},
+					default="Grid Search" if "Grid Search" in tuning_options else tuning_options[0],
+				)
 
 		if model_family == "Statistical":
 			st.subheader("Hyperparameter Tuning")
@@ -2428,6 +2661,17 @@ def main() -> None:
 			if "TPE (Optuna)" in tuning_options and not is_optuna_available():
 				tuning_options = [opt for opt in TUNING_METHODS if opt != "TPE (Optuna)"]
 				st.info("TPE tuning requires Optuna. Install with: pip install optuna")
+			normalize_selector_state(
+				"tuning_method",
+				tuning_options,
+				aliases={
+					"grid": "Grid Search",
+					"manual tuning": "Manual",
+					"optuna": "TPE (Optuna)",
+					"none": "None",
+				},
+				default="Grid Search" if "Grid Search" in tuning_options else tuning_options[0],
+			)
 
 			tuning_method = st.selectbox("Tuning method", tuning_options, key="tuning_method")
 			cv_folds = synced_slider_number(
@@ -2922,7 +3166,7 @@ def main() -> None:
 				st.rerun()
 		with col_b:
 			if st.button("Start Over"):
-				clear_workflow_state(keep_original=False)
+				clear_workflow_state()
 				st.session_state["step"] = 0
 				st.session_state["scroll_to_top"] = True
 				st.rerun()

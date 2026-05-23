@@ -13,6 +13,8 @@ from ai_agent.copilot_utils import (
     is_requirement_message,
     strip_internal_plan_payload,
     sanitize_user_facing_text,
+    update_conversation_memory_from_assistant,
+    update_conversation_memory_from_user,
 )
 from ai_agent.llm_client import call_groq, groq_token_loaded, explain_groq_error, classify_task_route
 from ai_agent.llm_client import DEFAULT_REASONER_MODEL
@@ -46,6 +48,8 @@ def render_chat_dock() -> None:
                 st.warning("Please enter a message before sending.")
                 return
 
+            update_conversation_memory_from_user(user_text)
+
             msgs = st.session_state.get("agent_chat_messages", [])
             msgs.append({"role": "user", "content": user_text})
             st.session_state["agent_chat_messages"] = msgs[-50:]
@@ -61,8 +65,10 @@ def render_chat_dock() -> None:
                     reqs.insert(0, {"text": user_text, "time": datetime.now().isoformat()})
                     st.session_state["agent_requirements"] = reqs[:50]
                     msgs = st.session_state.get("agent_chat_messages", [])
-                    msgs.append({"role": "assistant", "content": "Noted. Requirement recorded."})
+                    requirement_reply = "Noted. Requirement recorded."
+                    msgs.append({"role": "assistant", "content": requirement_reply})
                     st.session_state["agent_chat_messages"] = msgs[-50:]
+                    update_conversation_memory_from_assistant(requirement_reply)
                     activity = st.session_state.get("agent_activity", [])
                     activity.insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(), "level": "info", "message": "Requirement recorded via chat."})
                     st.session_state["agent_activity"] = activity[:50]
@@ -110,7 +116,7 @@ def render_chat_dock() -> None:
                             force_model=DEFAULT_REASONER_MODEL,
                         ) or ""
                     else:
-                        route_model = classify_task_route(user_text, context)
+                        selected_model_name = classify_task_route(user_text, context)
                         prompt = (
                             "You are Auto AI. Answer with the result first. "
                             "Keep the reply short, direct, and action-oriented. Do not explain your thinking unless the user asks for it. "
@@ -123,7 +129,7 @@ def render_chat_dock() -> None:
                             max_new_tokens=180,
                             task_type="chat",
                             context=context,
-                            force_model=route_model,
+                            force_model=selected_model_name,
                         ) or ""
                 if reply.startswith("ERROR:"):
                     activity = st.session_state.get("agent_activity", [])
@@ -136,13 +142,16 @@ def render_chat_dock() -> None:
                 msgs = st.session_state.get("agent_chat_messages", [])
                 msgs.append({"role": "assistant", "content": reply})
                 st.session_state["agent_chat_messages"] = msgs[-50:]
+                update_conversation_memory_from_assistant(reply)
                 activity = st.session_state.get("agent_activity", [])
                 activity.insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(), "level": "info", "message": "Auto AI replied to chat."})
                 st.session_state["agent_activity"] = activity[:50]
             else:
                 msgs = st.session_state.get("agent_chat_messages", [])
-                msgs.append({"role": "assistant", "content": "LLM not configured. Set GROQ_API_KEY to enable responses."})
+                missing_llm_reply = "LLM not configured. Set GROQ_API_KEY to enable responses."
+                msgs.append({"role": "assistant", "content": missing_llm_reply})
                 st.session_state["agent_chat_messages"] = msgs[-50:]
+                update_conversation_memory_from_assistant(missing_llm_reply)
                 activity = st.session_state.get("agent_activity", [])
                 activity.insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(), "level": "warn", "message": "LLM not configured; no reply."})
                 st.session_state["agent_activity"] = activity[:50]

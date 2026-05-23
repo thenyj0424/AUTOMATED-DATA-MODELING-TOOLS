@@ -11,6 +11,11 @@ KNOWLEDGE_BASE_DIR = BASE_DIR / "knowledge_base"
 DEFAULT_ROUTER_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip().strip('"').strip("'")
 DEFAULT_REASONER_MODEL = os.getenv("GROQ_MODEL2", "meta-llama/llama-4-scout-17b-16e-instruct").strip().strip('"').strip("'")
 DEFAULT_REVIEWER_MODEL = os.getenv("GROQ_MODEL3", "llama-3.3-70b-versatile").strip().strip('"').strip("'")
+DEFAULT_ROUTER_MODEL_BACKUP = os.getenv("GROQ_MODEL_BACKUP", DEFAULT_ROUTER_MODEL).strip().strip('"').strip("'")
+DEFAULT_REASONER_MODEL_BACKUP = os.getenv("GROQ_MODEL_BACKUP2", DEFAULT_REASONER_MODEL).strip().strip('"').strip("'")
+DEFAULT_REVIEWER_MODEL_BACKUP = os.getenv("GROQ_MODEL_BACKUP3", DEFAULT_REVIEWER_MODEL).strip().strip('"').strip("'")
+DEFAULT_GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip().strip('"').strip("'")
+DEFAULT_GROQ_API_KEY_BACKUP = os.getenv("GROQ_API_KEY_BACKUP", "").strip().strip('"').strip("'")
 
 LLM_MODEL = DEFAULT_ROUTER_MODEL
 
@@ -21,11 +26,49 @@ REVIEWER_MODEL = "reviewer"
 RAG_MODES = {"router", "reasoner", "reviewer", "default"}
 
 MODEL_FALLBACKS = {
-	# reviewer is the backup model when router/reasoner fail or hit rate limits
-	DEFAULT_ROUTER_MODEL: [DEFAULT_ROUTER_MODEL, DEFAULT_REVIEWER_MODEL, DEFAULT_REASONER_MODEL],
-	DEFAULT_REASONER_MODEL: [DEFAULT_REASONER_MODEL, DEFAULT_REVIEWER_MODEL, DEFAULT_ROUTER_MODEL],
-	DEFAULT_REVIEWER_MODEL: [DEFAULT_REVIEWER_MODEL, DEFAULT_ROUTER_MODEL, DEFAULT_REASONER_MODEL],
+	DEFAULT_ROUTER_MODEL: [
+		DEFAULT_ROUTER_MODEL,
+		DEFAULT_REASONER_MODEL_BACKUP,
+		DEFAULT_REVIEWER_MODEL_BACKUP,
+		DEFAULT_ROUTER_MODEL_BACKUP,
+	],
+	DEFAULT_REASONER_MODEL: [
+		DEFAULT_REASONER_MODEL,
+		DEFAULT_REVIEWER_MODEL_BACKUP,
+		DEFAULT_ROUTER_MODEL_BACKUP,
+		DEFAULT_REASONER_MODEL_BACKUP,
+	],
+	DEFAULT_REVIEWER_MODEL: [
+		DEFAULT_REVIEWER_MODEL,
+		DEFAULT_ROUTER_MODEL_BACKUP,
+		DEFAULT_REASONER_MODEL_BACKUP,
+		DEFAULT_REVIEWER_MODEL_BACKUP,
+	],
 }
+
+
+def _normalize_env_value(value: Optional[str]) -> str:
+	return str(value or "").strip().strip('"').strip("'")
+
+
+def _model_chain_for(model_name: str) -> List[str]:
+	chain = MODEL_FALLBACKS.get(model_name, [model_name])
+	if model_name not in chain:
+		chain = [model_name] + list(chain)
+	seen: set[str] = set()
+	ordered: List[str] = []
+	for candidate in chain:
+		if not candidate or candidate in seen:
+			continue
+		seen.add(candidate)
+		ordered.append(candidate)
+	return ordered
+
+
+def _token_chain() -> List[str]:
+	primary_token = os.getenv("GROQ_API_KEY", DEFAULT_GROQ_API_KEY).strip().strip('"').strip("'")
+	backup_token = os.getenv("GROQ_API_KEY_BACKUP", DEFAULT_GROQ_API_KEY_BACKUP).strip().strip('"').strip("'")
+	return [token for token in [primary_token, backup_token] if token]
 
 
 def get_model_name(mode: str = "default") -> str:
@@ -214,24 +257,23 @@ def call_groq(
 	context: str = "",
 	force_model: Optional[str] = None,
 ) -> Optional[str]:
-	token = os.getenv("GROQ_API_KEY")
-	if not token:
+	token_chain = _token_chain()
+	if not token_chain:
 		return None
 
 	try:
 		model_name, routed_mode = route_model(task_type=task_type, prompt=prompt, context=context)
 		if force_model:
-			model_name = force_model
-		fallback_chain = MODEL_FALLBACKS.get(model_name, [model_name, DEFAULT_REASONER_MODEL, DEFAULT_ROUTER_MODEL, DEFAULT_REVIEWER_MODEL])
-		seen = set()
+			model_name = get_model_name(force_model) if force_model in RAG_MODES else force_model
+		fallback_chain = _model_chain_for(model_name)
 		last_error: Optional[Exception] = None
-		for candidate_model in fallback_chain:
-			if not candidate_model or candidate_model in seen:
+		for index, candidate_model in enumerate(fallback_chain):
+			candidate_token = token_chain[min(index, len(token_chain) - 1)]
+			if not candidate_model or not candidate_token:
 				continue
-			seen.add(candidate_model)
 			try:
 				client = ChatGroq(
-					api_key=token,
+					api_key=candidate_token,
 					model=candidate_model,
 					temperature=0.2,
 					max_tokens=max_new_tokens,
@@ -241,8 +283,8 @@ def call_groq(
 					return response.content.strip()
 			except Exception as exc:
 				last_error = exc
-				# Continue to the next fallback model for transient failures such as rate limits,
-				# quota limits, timeouts, or model-not-found errors.
+				# Continue to the next fallback model/key pair for transient failures such as
+				# rate limits, quota limits, timeouts, or model-not-found errors.
 				continue
 		if last_error is not None:
 			return f"ERROR: Groq request failed for model {model_name} - {last_error}"
@@ -295,4 +337,4 @@ def explain_groq_error(error_text: str) -> str:
 
 
 def groq_token_loaded() -> bool:
-	return bool(os.getenv("GROQ_API_KEY"))
+	return bool(_token_chain())
