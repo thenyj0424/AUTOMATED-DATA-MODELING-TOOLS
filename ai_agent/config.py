@@ -1,4 +1,4 @@
-APP_TITLE = "Guided Data Analytics Agent"
+APP_TITLE = "Automated Data Modeling Tools"
 
 DEFAULT_MAX_ROWS = 20000
 DEFAULT_MAX_FEATURES = 50
