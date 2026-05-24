@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 
 from ai_agent.auto_engine import apply_auto_actions_snapshot
+import ai_agent.auto_engine as auto_engine
 
 
 def make_df(with_nans=False):
@@ -202,3 +203,16 @@ def test_apply_auto_actions_defaults_vague_time_series_to_holt_winters():
     assert changes.get("hw_trend") == "add"
     assert changes.get("hw_seasonal") == "add"
     assert any("holt" in a.lower() or "forecast" in a.lower() for a in activities)
+
+
+def test_apply_auto_actions_ignores_chat_widget_state(monkeypatch):
+    df = make_tabular_df()
+    monkeypatch.setattr(auto_engine, "groq_token_loaded", lambda: True)
+    monkeypatch.setattr(
+        auto_engine,
+        "call_groq",
+        lambda *args, **kwargs: '{"changes": {"chat_dock_input": "stale text", "model_family": "ML"}, "activities": ["test"]}',
+    )
+    changes, activities = apply_auto_actions_snapshot({}, 3, df)
+    assert "chat_dock_input" not in changes
+    assert changes.get("model_family") == "ML"

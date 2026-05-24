@@ -238,7 +238,7 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
                     ks = str(k)
                     if ks.startswith("agent_"):
                         continue
-                    if ks in {"step", "cleaning_confirmed", "analysis_ready"}:
+                    if ks in {"step", "cleaning_confirmed", "analysis_ready", "chat_dock_input"}:
                         continue
                     clean_changes[ks] = v
                 clean_acts = [str(a) for a in acts if str(a).strip()]

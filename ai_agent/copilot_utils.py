@@ -749,6 +749,13 @@ def build_rule_based_step_hint(step: int, df: Optional[pd.DataFrame], summary: A
 	return "AI assistant is ready for the current step."
 
 
+def _format_column_preview(df: Optional[pd.DataFrame], limit: int = 5) -> str:
+	if df is None:
+		return ""
+	columns = [str(col) for col in list(df.columns)[:limit]]
+	return ", ".join(columns)
+
+
 def build_copilot_context(step: int, df: Optional[pd.DataFrame], summary: Any) -> str:
 	parts = [f"Step: {step}"]
 	warmup_context = st.session_state.get("rag_warmup_context")
@@ -924,17 +931,32 @@ def build_dataset_analysis_context(
 
 def build_hybrid_step_hint(step: int, df: Optional[pd.DataFrame], summary: Any) -> str:
 	rule_hint = build_rule_based_step_hint(step, df, summary)
-	if not groq_token_loaded():
+	if df is None and summary is None:
 		return rule_hint
-	prompt = (
-		"You are an AI copilot in a data app. Use the rule hint and context to provide one short actionable line. "
-		"Do not exceed 30 words. Focus on the current step and prior outcome if present.\n"
-		f"Rule hint: {rule_hint}\n"
-		f"Context:\n{build_copilot_context(step, df, summary)}"
-	)
-	text = call_groq(prompt, max_new_tokens=60, task_type="reasoning")
-	if text and not text.startswith("ERROR:"):
-		return text
+	columns = [str(col) for col in list(df.columns)] if df is not None else []
+	active_target = get_active_target_column()
+	column_preview = _format_column_preview(df)
+
+	if step == 0:
+		return rule_hint
+	if step == 1 and summary is not None:
+		base = f"Dataset has {summary.rows} rows and {summary.cols} columns."
+		if active_target and active_target in columns:
+			return f"{base} Current target: {active_target}. Focus on missingness and target relationships."
+		return f"{base} Pick a target from the current upload before modeling."
+	if step == 2 and df is not None:
+		missing_total = int(df.isna().sum().sum())
+		if missing_total > 0:
+			return "Missing values remain. Median/mode imputation is a safe default before modeling."
+		return "No missing values detected. You can proceed to modeling directly."
+	if step == 3:
+		if active_target and active_target in columns:
+			return f"Target is {active_target}. Confirm feature columns from the current upload only."
+		if column_preview:
+			return f"Pick a target from this dataset ({column_preview}) and confirm features from the current upload."
+		return "Pick a target from the current dataset and confirm features from the current upload."
+	if step == 4:
+		return "Review metrics, residuals, and feature importance for the current upload."
 	return rule_hint
 
 

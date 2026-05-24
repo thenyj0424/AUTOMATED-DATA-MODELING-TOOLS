@@ -8,6 +8,7 @@ import seaborn as sns
 import streamlit as st
 
 from ai_agent.copilot_utils import add_agent_activity, add_chat_message, build_hybrid_step_hint, summarize_results_for_ai
+from ai_agent.notebook_generator import NotebookGenerator, build_notebook_metadata_from_context
 from ai_agent.workflow_tools import build_report_payload
 
 
@@ -190,6 +191,34 @@ def _render_selected_features(features: List[str], label: str = "Selected Featur
 	with st.expander(label):
 		st.dataframe(pd.DataFrame({"feature": features}), use_container_width=True)
 
+def _render_notebook_export(results: Dict[str, Any], summary: Any) -> None:
+	"""Render the notebook export controls on the results page."""
+	st.markdown("### Notebook Export")
+	st.caption("Generate a reproducible Jupyter notebook from the current workflow metadata.")
+	if st.button("Generate Notebook", key="generate_notebook_export"):
+		generator = NotebookGenerator()
+		metadata = build_notebook_metadata_from_context(results, summary, st.session_state)
+		export_path, notebook_bytes = generator.export_notebook_bytes(metadata)
+		st.session_state["notebook_export_path"] = str(export_path)
+		st.session_state["notebook_export_name"] = export_path.name
+		st.session_state["notebook_export_bytes"] = notebook_bytes
+		add_agent_activity(f"Generated notebook export: {export_path.name}.")
+		st.success(f"Notebook generated: {export_path.name}")
+
+	export_bytes = st.session_state.get("notebook_export_bytes")
+	export_name = st.session_state.get("notebook_export_name")
+	if export_bytes and export_name:
+		st.download_button(
+			"Download notebook (.ipynb)",
+			data=export_bytes,
+			file_name=export_name,
+			mime="application/x-ipynb+json",
+			key="download_notebook_export",
+		)
+		export_path = st.session_state.get("notebook_export_path")
+		if export_path:
+			st.caption(f"Saved to {export_path}")
+
 
 def render_results_view(
 	results: Optional[Dict[str, Any]],
@@ -274,6 +303,7 @@ def render_results_view(
 				st.success("AI insight added to chat and activity panel.")
 			except Exception as exc:
 				st.warning(f"AI insight not available. Check LLM configuration or the results context. ({exc})")
+		_render_notebook_export(results, summary)
 
 	show_predictions = st.checkbox("Show prediction vs actual", key="show_predictions", value=True)
 	problem_type = results.get("problem_type")

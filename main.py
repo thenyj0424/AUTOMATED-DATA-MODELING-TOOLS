@@ -89,6 +89,7 @@ from ai_agent.results_view import render_results_view
 from ai_agent.copilot_utils import (
 	build_copilot_context,
 	build_dataset_readiness_bundle,
+	build_hybrid_step_hint as build_copilot_step_hint,
 	build_meta_help_reply,
 	build_dataset_analysis_context,
 	build_unsupported_tool_reply,
@@ -116,6 +117,8 @@ def init_state() -> None:
 		st.session_state["df"] = None
 	if "df_original" not in st.session_state:
 		st.session_state["df_original"] = None
+	if "dataset_name" not in st.session_state:
+		st.session_state["dataset_name"] = None
 	if "df_cleaned" not in st.session_state:
 		st.session_state["df_cleaned"] = None
 	if "df_outlier_cleaned" not in st.session_state:
@@ -217,6 +220,7 @@ def clear_workflow_state(keep_original: bool = True) -> None:
 		"agent_preferences",
 		"agent_preference_notes",
 		"agent_preference_last_update",
+		"dataset_name",
 		"chat_dock_input",
 		"requirement_text",
 	]
@@ -342,6 +346,26 @@ def _apply_auto_review_and_skip_to_modeling(step: int) -> None:
 	run_step_auto_actions(2)
 	cleaned_df = st.session_state.get("df_cleaned")
 	cleaned_summary = st.session_state.get("summary_cleaned")
+	if cleaned_df is None or cleaned_summary is None:
+		source_df = st.session_state.get("df")
+		if source_df is None:
+			source_df = st.session_state.get("df_original")
+		if source_df is not None:
+			if source_df.isna().any().any():
+				fallback_df = impute_missing_values(source_df.copy(), numeric_strategy="median", impute_categorical=True)
+				_finalize_cleaned_dataset(
+					fallback_df,
+					build_summary(fallback_df),
+					"Auto AI filled missing values with median/mode imputation.",
+				)
+			else:
+				st.session_state["df"] = source_df
+				st.session_state["summary"] = st.session_state.get("summary") or build_summary(source_df)
+				st.session_state["cleaning_confirmed"] = True
+				st.session_state["analysis_ready"] = True
+				st.session_state["analysis_ready_message"] = "Auto AI skipped cleaning because no missing values were detected."
+			cleaned_df = st.session_state.get("df_cleaned")
+			cleaned_summary = st.session_state.get("summary_cleaned")
 	if cleaned_df is not None and cleaned_summary is not None:
 		st.session_state["df"] = cleaned_df
 		st.session_state["summary"] = cleaned_summary
@@ -519,26 +543,7 @@ def build_rule_based_step_hint(step: int, df: Optional[pd.DataFrame], summary: A
 
 
 def build_hybrid_step_hint(step: int, df: Optional[pd.DataFrame], summary: Any) -> str:
-	rule_hint = build_rule_based_step_hint(step, df, summary)
-	if not groq_token_loaded():
-		return rule_hint
-	context = ""
-	if summary is not None:
-		context = (
-			f"Rows: {summary.rows}, Cols: {summary.cols}, "
-			f"Numeric: {len(summary.numeric_cols)}, Categorical: {len(summary.categorical_cols)}"
-		)
-	prompt = (
-		"You are an AI copilot in a data app. Use this rule hint and context to provide one short actionable line. "
-		"Do not exceed 30 words.\n"
-		f"Step: {step}\n"
-		f"Rule hint: {rule_hint}\n"
-		f"Context: {context}"
-	)
-	text = call_groq(prompt, max_new_tokens=60, task_type="reasoning")
-	if text and not text.startswith("ERROR:"):
-		return text
-	return rule_hint
+	return build_copilot_step_hint(step, df, summary)
 
 
 def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> None:
@@ -752,7 +757,7 @@ def run_step_auto_actions(step: int) -> None:
 				activities.append("Auto mode used the KB to align the suggestion with the fixed workflow.")
 
 		# Enforce strict gating: do not allow auto actions to change control-flow keys
-		CONTROL_KEYS = {"step", "cleaning_confirmed", "analysis_ready"}
+		CONTROL_KEYS = {"step", "cleaning_confirmed", "analysis_ready", "chat_dock_input"}
 		applied = []
 		ignored = []
 		# Apply model_family first, then model_name, then remaining keys to avoid UI mismatch.
@@ -1676,6 +1681,16 @@ def run_modeling_flow(settings: Dict[str, Any]) -> Dict[str, Any]:
 	target_col = settings["target_col"]
 	feature_cols = settings["feature_cols"]
 	model_name = settings["model_name"]
+	model_family = settings.get("model_family")
+	if model_family not in {"Statistical", "ML"}:
+		if model_name in STATISTICAL_CLASSIFICATION_MODELS + STATISTICAL_REGRESSION_MODELS:
+			model_family = "Statistical"
+		elif model_name in ML_CLASSIFICATION_MODELS + ML_REGRESSION_MODELS:
+			model_family = "ML"
+		elif problem_type == "time_series":
+			model_family = "Statistical"
+		else:
+			model_family = "ML"
 	feature_selection = settings["feature_selection"]
 	stepwise_direction = settings["stepwise_direction"]
 	model_based = settings["model_based"]
@@ -1746,10 +1761,13 @@ def run_modeling_flow(settings: Dict[str, Any]) -> Dict[str, Any]:
 		"baseline_artifacts": baseline_artifacts,
 		"baseline_insights": baseline_insights,
 		"tuned": None,
+		"dataset_name": st.session_state.get("dataset_name"),
 		"problem_type": problem_type,
 		"metric_label": metric_label,
 		"metric_scoring": metric_scoring,
 		"model_name": model_name,
+		"model_family": model_family,
+		"target_col": target_col,
 		"feature_selection": feature_selection,
 		"selected_features": baseline["selected_features"],
 	}
@@ -1869,6 +1887,7 @@ def main() -> None:
 		uploaded = st.file_uploader("Upload CSV", type=["csv"])
 		if uploaded:
 			df = read_csv(uploaded)
+			st.session_state["dataset_name"] = getattr(uploaded, "name", "dataset.csv")
 			st.session_state["df_original"] = df.copy()
 			st.session_state["df"] = df.copy()
 			st.session_state["summary"] = build_summary(df)
@@ -2457,7 +2476,9 @@ def main() -> None:
 				else:
 					st.session_state["results"] = {
 						"problem_type": "time_series",
+						"dataset_name": st.session_state.get("dataset_name"),
 						"model_name": model_name,
+						"target_col": target_col,
 						"time_series_mode": params.get("mode", "Manual"),
 						"time_series": results
 					}
@@ -2842,6 +2863,7 @@ def main() -> None:
 						"target_col": target_col,
 						"feature_cols": feature_cols,
 						"model_name": model_name,
+						"model_family": model_family,
 						"feature_selection": feature_selection,
 						"stepwise_direction": stepwise_direction,
 						"model_based": model_based,

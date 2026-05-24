@@ -22,3 +22,4 @@ sqlalchemy==2.0.32
 pyarrow==17.0.0
 tabulate==0.9.0
 altair==5.3.0
+nbformat==5.10.4
