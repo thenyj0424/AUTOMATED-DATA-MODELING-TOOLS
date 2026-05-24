@@ -18,7 +18,6 @@ Supported Step-1 keys:
 - eda_show_target_dist
 - eda_show_target_rel
 - eda_show_pairplot
-- eda_show_outliers
 - eda_target_col
 - eda_target_feature
 - eda_numeric_column
@@ -29,7 +28,7 @@ Selection policy:
 - Enable correlation only if at least two numeric columns exist.
 - Enable target distribution/relationships only if a valid target is known.
 - Enable pairplot only for smaller feature sets to avoid heavy output.
-- Enable outlier summary when numeric columns exist.
+- Outlier review is handled in the cleaning step, not as a Step-1 EDA control.
 
 Target policy:
 - Prefer a categorical target for classification-oriented EDA.

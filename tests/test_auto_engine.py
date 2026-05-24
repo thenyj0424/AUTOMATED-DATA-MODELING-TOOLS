@@ -42,15 +42,27 @@ def test_apply_auto_actions_step1_basic():
     assert any("target pair" in a.lower() for a in activities)
 
 
+def test_apply_auto_actions_step1_records_outlier_review_note():
+    df = make_tabular_df().copy()
+    df.loc[0, "feature_a"] = 9999
+    state = {}
+    changes, activities = apply_auto_actions_snapshot(state, 1, df)
+    assert "cleaning_review_note" in changes
+    assert "outlier" in str(changes.get("cleaning_review_note", "")).lower() or any("outlier" in a.lower() for a in activities)
+
+
 def test_apply_auto_actions_step2_cleaning_detected():
     df = make_df(with_nans=True)
-    state = {}
+    state = {"cleaning_review_note": "Outliers detected in: value."}
     changes, activities = apply_auto_actions_snapshot(state, 2, df)
     # Expect cleaning decisions or preview keys
     assert isinstance(changes, dict)
     # At least one activity message should be present describing cleaning
     # match 'clean' or 'imput' to accept both 'impute' and 'imputation'
     assert any("clean" in a.lower() or "imput" in a.lower() for a in activities)
+    assert "cleaning_review_note" in changes
+    assert "outlier" in changes["cleaning_review_note"].lower()
+    assert "imput" in changes["cleaning_review_note"].lower()
 
 
 def test_no_step_advance_in_changes():

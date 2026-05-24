@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import re
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -290,6 +291,27 @@ def should_run_statistical_tools(user_text: str) -> bool:
     text = str(user_text or "").lower()
     if not text:
         return False
+    if re.search(r"\bnormal(y|ly)?\b", text) or any(
+        phrase in text
+        for phrase in ["normally distributed", "normal distribution", "gaussian", "bell curve"]
+    ):
+        return True
+    if any(
+        phrase in text
+        for phrase in [
+            "constant variance",
+            "variance is constant",
+            "variance constant",
+            "homoscedastic",
+            "homoskedastic",
+            "heteroscedastic",
+            "heteroskedastic",
+            "heterokedastic",
+            "heterokedrastic",
+            "constant variance of",
+        ]
+    ):
+        return True
     tokens = [
         "stationarity",
         "adf",
@@ -303,7 +325,6 @@ def should_run_statistical_tools(user_text: str) -> bool:
         "heteroscedastic",
         "breusch",
         "statistical test",
-        "hypothesis test",
     ]
     return any(token in text for token in tokens)
 

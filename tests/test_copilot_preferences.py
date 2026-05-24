@@ -16,8 +16,19 @@ def setup_state():
 def test_update_preferences_from_text_detects_ml_preference():
     prefs, updates = update_preferences_from_text("I prefer ML model and care about accuracy", {})
     assert prefs.get("preferred_model_family") == "ML"
+    assert prefs.get("preferred_model_name") == "Random Forest"
     assert prefs.get("priority") == "accuracy"
-    assert any("model family = ML" in item for item in updates)
+    assert any("Random Forest" in item for item in updates)
+
+
+def test_update_preferences_from_text_switches_to_statistical_model():
+    prefs, updates = update_preferences_from_text(
+        "I want statistical model instead",
+        {"preferred_model_family": "ML", "preferred_model_name": "Random Forest"},
+    )
+    assert prefs.get("preferred_model_family") == "Statistical"
+    assert prefs.get("preferred_model_name") in {"Logistic Regression", "Linear Regression"}
+    assert any("Statistical" in item for item in updates)
 
 
 def test_build_copilot_context_includes_stored_preferences():

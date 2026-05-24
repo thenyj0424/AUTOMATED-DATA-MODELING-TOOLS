@@ -6,12 +6,16 @@ from ai_agent.copilot_utils import (
     build_dataset_analysis_context,
     build_dataset_readiness_bundle,
     build_meta_help_reply,
+    build_supported_tool_summary,
+    build_unsupported_tool_reply,
     condense_user_facing_text,
     format_conversation_memory_for_context,
     is_short_acknowledgement,
     is_dataset_question,
     is_meta_help_request,
     is_requirement_message,
+    is_unsupported_statistical_request,
+    is_statistical_diagnostic_request,
     sanitize_user_facing_text,
     strip_internal_plan_payload,
     update_conversation_memory_from_assistant,
@@ -28,6 +32,39 @@ def test_is_requirement_message_detects_labelled():
 def test_is_requirement_message_detects_declarative():
     assert is_requirement_message("The analytics pipeline must refresh nightly and export CSVs to /data")
     assert not is_requirement_message("Can you suggest a model for this dataset?")
+
+
+def test_is_requirement_message_rejects_question_like_statements():
+    assert not is_requirement_message("What are the requirements for this model setup")
+    assert not is_requirement_message("I need to know which model should I use for this dataset")
+
+
+def test_is_requirement_message_detects_direct_instruction_language():
+    assert is_requirement_message("Please use a Random Forest model and keep it fast")
+    assert is_requirement_message("We need to forecast this series monthly")
+
+
+def test_unsupported_statistical_request_detection_and_reply():
+    assert is_unsupported_statistical_request("Conduct a hypothesis testing to know whether the mean lot size is less than 3 or not")
+    assert not is_unsupported_statistical_request("Run a normality check on the residuals")
+    reply = build_unsupported_tool_reply("Conduct a hypothesis testing to know whether the mean lot size is less than 3 or not")
+    assert "unavailable" in reply.lower()
+    assert "hypothesis" in reply.lower()
+
+
+def test_statistical_diagnostic_request_detects_natural_language_normality_questions():
+    assert is_statistical_diagnostic_request("Is house price normally distributed?")
+    assert is_statistical_diagnostic_request("Can you use shapiro wilk to know whether lot size is normally distributed or not?")
+    assert is_statistical_diagnostic_request("Is house price constant variance?")
+    assert is_statistical_diagnostic_request("heterokedrasticity of house price")
+    assert not is_statistical_diagnostic_request("Conduct a hypothesis testing to know whether the mean lot size is less than 3 or not")
+
+
+def test_supported_tool_summary_mentions_available_tool_families():
+    summary = build_supported_tool_summary()
+    assert "ML models" in summary
+    assert "statistical diagnostics" in summary
+    assert "stationarity" in summary.lower()
 
 
 def test_build_copilot_context_contains_system_policy():
@@ -74,11 +111,11 @@ def test_apply_requirement_to_state_sets_default_ml_model():
         if k.startswith("model_") or k in {"problem_type", "agent_requirements"}:
             del st.session_state[k]
     from ai_agent.copilot_utils import apply_requirement_to_state
-    notes = apply_requirement_to_state("Please use any ML model for this task")
-    # Do not force `model_family` or `model_name`; instead a flexible hint should be set.
-    assert "model_name" not in st.session_state
+    notes = apply_requirement_to_state("Please use an ML model for this task")
+    assert st.session_state.get("model_family") == "ML"
+    assert st.session_state.get("model_name") == "Random Forest"
     assert st.session_state.get("model_selection_hint", {}).get("family") == "ML"
-    assert any("prefer ML models" in n or "preference hint" in n for n in notes)
+    assert any("Random Forest" in n for n in notes)
 
 
 def test_apply_requirement_to_state_sets_statistical_hint():
@@ -143,9 +180,13 @@ def test_dataset_analysis_context_runs_statistical_tools_only_when_requested():
     st.session_state["target_col"] = "target"
     plain = build_dataset_analysis_context(1, df, summary, "Which model is suitable?")
     stats = build_dataset_analysis_context(1, df, summary, "Can you run stationarity and VIF checks?")
+    normality = build_dataset_analysis_context(1, df, summary, "Is house price normally distributed?")
+    variance = build_dataset_analysis_context(1, df, summary, "Is house price constant variance?")
     assert plain["on_demand_tools"] == {}
     assert "multicollinearity_analysis" in stats["on_demand_tools"]
     assert "stationarity_analysis" in stats["on_demand_tools"]
+    assert "normality_analysis" in normality["on_demand_tools"]
+    assert "heteroscedasticity_analysis" in variance["on_demand_tools"]
 
 
 def test_dataset_readiness_bundle_and_copilot_context_use_cache():

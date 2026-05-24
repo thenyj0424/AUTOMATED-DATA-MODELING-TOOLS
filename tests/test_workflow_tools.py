@@ -109,6 +109,10 @@ def test_statistical_tools_trigger_and_run_on_demand():
     )
     assert should_run_statistical_tools("run normality and VIF checks") is True
     assert should_run_statistical_tools("hello there") is False
+    assert should_run_statistical_tools("conduct hypothesis testing for the mean") is False
+    assert should_run_statistical_tools("is house price normally distributed") is True
+    assert should_run_statistical_tools("is house price constant variance") is True
+    assert should_run_statistical_tools("heterokedrasticity of house price") is True
     result = run_statistical_tools_on_demand(df, user_text="check stationarity and correlation", target_col="target")
     assert "stationarity_analysis" in result
     assert "correlation_analysis" in result

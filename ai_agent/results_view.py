@@ -275,6 +275,7 @@ def render_results_view(
 			except Exception as exc:
 				st.warning(f"AI insight not available. Check LLM configuration or the results context. ({exc})")
 
+	show_predictions = st.checkbox("Show prediction vs actual", key="show_predictions", value=True)
 	problem_type = results.get("problem_type")
 
 	if problem_type == "time_series":

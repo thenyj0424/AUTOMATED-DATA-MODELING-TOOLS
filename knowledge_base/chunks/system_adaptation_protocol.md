@@ -41,6 +41,12 @@ Efficiency rules for free tier:
 - Avoid broad generic explanations in generated plans.
 - Keep activities short and operational.
 
+Auto-mode workflow rules:
+- When auto mode is enabled, it may fast-path directly to modeling review after applying supported cleaning decisions.
+- Always surface the cleaning decisions in the modeling review so the user can inspect what was chosen.
+- Do not invent new cleaning actions; choose from the supported outlier review and missing-value options only.
+- For outliers, recommend keep versus remove using the dataset profile and domain plausibility, then let the modeling review toggle that choice back if the user disagrees.
+
 Safety rules:
 - Never set control-flow keys in AI plan: step, cleaning_confirmed, analysis_ready.
 - Never propose unknown session keys.

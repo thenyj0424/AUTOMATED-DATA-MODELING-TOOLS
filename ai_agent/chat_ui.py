@@ -8,9 +8,12 @@ from ai_agent.copilot_utils import (
     condense_user_facing_text,
     build_meta_help_reply,
     build_dataset_analysis_context,
+    build_unsupported_tool_reply,
     is_dataset_question,
     is_meta_help_request,
     is_requirement_message,
+    is_unsupported_statistical_request,
+    is_statistical_diagnostic_request,
     strip_internal_plan_payload,
     sanitize_user_facing_text,
     update_conversation_memory_from_assistant,
@@ -81,6 +84,17 @@ def render_chat_dock() -> None:
                         st.session_state["agent_activity"] = activity[:50]
                     return
 
+                if is_unsupported_statistical_request(user_text):
+                    reply = build_unsupported_tool_reply(user_text)
+                    msgs = st.session_state.get("agent_chat_messages", [])
+                    msgs.append({"role": "assistant", "content": reply})
+                    st.session_state["agent_chat_messages"] = msgs[-50:]
+                    update_conversation_memory_from_assistant(reply)
+                    activity = st.session_state.get("agent_activity", [])
+                    activity.insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(), "level": "info", "message": "Unsupported statistical request redirected to available tools."})
+                    st.session_state["agent_activity"] = activity[:50]
+                    return
+
                 with st.spinner("AI thinking..."):
                     context = build_copilot_context(
                         st.session_state.get("step", 0),
@@ -89,7 +103,7 @@ def render_chat_dock() -> None:
                     )
                     if is_meta_help_request(user_text):
                         reply = build_meta_help_reply(user_text, st.session_state.get("agent_goal", ""))
-                    elif is_dataset_question(user_text, st.session_state.get("step", 0), st.session_state.get("df"), st.session_state.get("summary")):
+                    elif is_dataset_question(user_text, st.session_state.get("step", 0), st.session_state.get("df"), st.session_state.get("summary")) or is_statistical_diagnostic_request(user_text):
                         dataset_context = build_dataset_analysis_context(
                             st.session_state.get("step", 0),
                             st.session_state.get("df"),

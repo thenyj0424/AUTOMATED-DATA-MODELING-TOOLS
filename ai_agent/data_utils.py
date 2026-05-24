@@ -44,6 +44,7 @@ def build_summary(df: pd.DataFrame) -> DatasetSummary:
 	missing.columns = ["column", "missing_count"]
 	dtypes = df.dtypes.reset_index()
 	dtypes.columns = ["column", "dtype"]
+	dtypes["dtype"] = dtypes["dtype"].astype(str)
 	return DatasetSummary(
 		rows=df.shape[0],
 		cols=df.shape[1],

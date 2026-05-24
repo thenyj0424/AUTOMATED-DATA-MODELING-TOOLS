@@ -9,6 +9,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
+from ai_agent.config import (
+	CLASSIFICATION_MODELS,
+	ML_CLASSIFICATION_MODELS,
+	ML_REGRESSION_MODELS,
+	REGRESSION_MODELS,
+	STATISTICAL_CLASSIFICATION_MODELS,
+	STATISTICAL_REGRESSION_MODELS,
+)
 from ai_agent.llm_client import call_groq, groq_token_loaded
 from ai_agent.rag_store import build_workflow_rag_context
 from ai_agent.workflow_tools import (
@@ -22,19 +30,55 @@ from ai_agent.workflow_tools import (
 def is_requirement_message(user_text: str) -> bool:
 	"""Heuristic to detect requirement-style messages.
 
-	Treat messages as requirements when the user labels them (e.g. "Requirement:")
-	or when the text is declarative (no question mark) and reasonably long.
+	Treat messages as requirements when the user labels them explicitly or when the
+	text reads like a direct instruction or constraint. Question-like messages stay
+	as questions so they are not auto-recorded as requirements.
 	"""
 	if not user_text:
 		return False
 	txt = user_text.strip()
 	lower = txt.lower()
-	if lower.startswith(("requirement:", "requirement -", "req:", "req -")):
+	if _is_requirement_label(txt):
 		return True
-	if "requirement" in lower:
+	if _looks_like_question(txt):
+		return False
+	requirement_phrases = (
+		"must",
+		"need to",
+		"need a",
+		"need an",
+		"please use",
+		"please make",
+		"please set",
+		"please choose",
+		"prefer",
+		"avoid",
+		"do not",
+		"don't",
+		"i want you to",
+		"i would like you to",
+		"i'd like you to",
+		"i need you to",
+		"make sure",
+		"ensure",
+		"use any",
+		"use a",
+		"use an",
+		"use the",
+		"set the",
+		"run the",
+		"forecast",
+		"clean",
+		"train",
+		"build",
+		"select",
+		"choose",
+		"apply",
+		"record",
+	)
+	if any(phrase in lower for phrase in requirement_phrases):
 		return True
-	# Declarative heuristic: no question mark and at least 5 words
-	if "?" not in txt and len(txt.split()) >= 5:
+	if len(txt.split()) >= 5 and any(token in lower for token in ["must", "need", "should", "prefer", "avoid", "use", "set", "choose", "require", "ensure", "include", "exclude"]):
 		return True
 	return False
 
@@ -139,6 +183,77 @@ def _normalize_request_text_local(text: str) -> str:
 
 def _has_phrase(text: str, phrase: str) -> bool:
 	return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
+
+
+def _looks_like_question(user_text: str) -> bool:
+	text = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
+	if not text:
+		return False
+	if "?" in text:
+		return True
+	question_starters = (
+		"can you",
+		"could you",
+		"would you",
+		"will you",
+		"should you",
+		"do you",
+		"did you",
+		"does it",
+		"is it",
+		"are you",
+		"am i",
+		"was it",
+		"were you",
+		"may i",
+		"might i",
+		"have you",
+		"has it",
+		"what",
+		"which",
+		"when",
+		"where",
+		"why",
+		"how",
+		"who",
+		"whose",
+	)
+	if any(text.startswith(starter) for starter in question_starters):
+		return True
+	question_phrases = (
+		"what should i",
+		"which model should i",
+		"should i",
+		"can i",
+		"could i",
+		"would it be",
+		"is it possible",
+		"is there a way",
+		"what if",
+		"how about",
+		"what about",
+		"tell me",
+		"do you think",
+		"i need to know",
+		"i want to know",
+		"i'd like to know",
+		"need to know",
+		"please tell me",
+	)
+	return any(phrase in text for phrase in question_phrases)
+
+
+def _is_requirement_label(user_text: str) -> bool:
+	text = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
+	if not text:
+		return False
+	label_patterns = (
+		r"^(requirement|requirements|req)\s*[:\-]",
+		r"^(requirement|requirements|req)\b$",
+		r"^(my|the|this|these|our)\s+requirements?\s*(are|is|include|must|should|need)\b",
+		r"^(my|the|this|these|our)\s+requirement\s*(is|should|must|needs)\b",
+	)
+	return any(re.search(pattern, text) for pattern in label_patterns)
 
 
 def infer_time_series_configuration(user_text: str) -> Dict[str, Any]:
@@ -266,6 +381,97 @@ def build_meta_help_reply(user_text: str, current_goal: str = "") -> str:
 	)
 
 
+def get_supported_tool_inventory() -> Dict[str, List[str]]:
+	return {
+		"ml_classification_models": list(ML_CLASSIFICATION_MODELS),
+		"ml_regression_models": list(ML_REGRESSION_MODELS),
+		"statistical_classification_models": list(STATISTICAL_CLASSIFICATION_MODELS),
+		"statistical_regression_models": list(STATISTICAL_REGRESSION_MODELS),
+		"available_statistical_diagnostics": [
+			"stationarity",
+			"correlation",
+			"normality",
+			"multicollinearity",
+			"heteroscedasticity",
+		],
+	}
+
+
+def build_supported_tool_summary() -> str:
+	inventory = get_supported_tool_inventory()
+	ml_models = sorted(set(inventory["ml_classification_models"] + inventory["ml_regression_models"]))
+	stat_models = sorted(set(inventory["statistical_classification_models"] + inventory["statistical_regression_models"]))
+	diagnostics = inventory["available_statistical_diagnostics"]
+	return (
+		"Supported tools: ML models = " + ", ".join(ml_models) + "; "
+		"statistical models = " + ", ".join(stat_models) + "; "
+		"statistical diagnostics = " + ", ".join(diagnostics) + "."
+	)
+
+
+def is_statistical_diagnostic_request(user_text: str) -> bool:
+	text = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
+	if not text:
+		return False
+	if is_unsupported_statistical_request(text):
+		return False
+	natural_language_patterns = [
+		r"\bnormal(y|ly)?\b",
+		"normally distributed",
+		"normal distribution",
+		"distribution is normal",
+		"gaussian",
+		"bell curve",
+		"stationary",
+		"stationarity",
+		"correlated",
+		"correlation",
+		"collinear",
+		"multicollinearity",
+		"vif",
+		"heteroscedastic",
+		"heteroskedastic",
+		"heterokedastic",
+		"heterokedrastic",
+		"constant variance",
+		"variance is constant",
+		"variance constant",
+		"homoscedastic",
+		"homoskedastic",
+		"adf",
+		"shapiro",
+		"jarque",
+	]
+	return any(re.search(pattern, text) for pattern in natural_language_patterns)
+
+
+def is_unsupported_statistical_request(user_text: str) -> bool:
+	text = str(user_text or "").lower()
+	if not text:
+		return False
+	unsupported_phrases = [
+		"t-test",
+		"t test",
+		"anova",
+		"chi-square",
+		"chi square",
+	]
+	return any(phrase in text for phrase in unsupported_phrases)
+
+
+def build_unsupported_tool_reply(user_text: str) -> str:
+	request = sanitize_user_facing_text(user_text).strip()
+	if request:
+		return (
+			f"That function is unavailable in this app: {request}. "
+			"I can still help with the supported statistical diagnostics or suggest a valid workflow step."
+		)
+	return (
+		"That function is unavailable in this app. "
+		"I can still help with the supported statistical diagnostics or suggest a valid workflow step."
+	)
+
+
 def apply_requirement_to_state(req_text: str) -> List[str]:
 	"""Parse a recorded requirement text and apply relevant session_state keys.
 
@@ -274,6 +480,7 @@ def apply_requirement_to_state(req_text: str) -> List[str]:
 	notes: List[str] = []
 	txt = _normalize_request_text_local(req_text)
 	ts_config = infer_time_series_configuration(req_text)
+	ml_explicit = any(_has_phrase(txt, phrase) for phrase in ["ml", "ml model", "machine learning", "machine learning model", "use an ml model", "use any ml model", "prefer ml model", "i want ml model"])
 
 	# Time-series hints
 	if ts_config:
@@ -288,16 +495,43 @@ def apply_requirement_to_state(req_text: str) -> List[str]:
 			if ts_config.get("hw_seasonal_periods") == 12:
 				notes.append("Applied requirement: hw_seasonal_periods = 12")
 
-	# Model family preferences as flexible hints — do not force a concrete family
-	if any(token in txt for token in ["ml", "machine learning", "random forest", "decision tree", "xgboost", "knn", "svm", "svr"]):
+	# Model family preferences from explicit ML wording should steer the app to an ML default.
+	if ml_explicit:
+		st.session_state.setdefault("model_selection_hint", {})
+		st.session_state["model_selection_hint"].update({"family": "ML", "flexible": False, "default_model": "Random Forest"})
+		st.session_state["model_family"] = "ML"
+		if st.session_state.get("model_name") in {"Logistic Regression", "Linear Regression", "Ridge", "Lasso"}:
+			st.session_state["model_name"] = "Random Forest"
+		elif "model_name" not in st.session_state:
+			st.session_state["model_name"] = "Random Forest"
+		notes.append("Applied requirement: use an ML model (defaulted to Random Forest)")
+	elif any(token in txt for token in ["ml", "machine learning", "random forest", "decision tree", "xgboost", "knn", "svm", "svr"]):
 		st.session_state.setdefault("model_selection_hint", {})
 		st.session_state["model_selection_hint"].update({"family": "ML", "flexible": True})
+		if st.session_state.get("model_family") == "Statistical" and st.session_state.get("model_name") in {"Logistic Regression", "Linear Regression", "Ridge", "Lasso"}:
+			st.session_state["model_name"] = "Random Forest"
 		notes.append("Applied requirement: prefer ML models (hint set)")
 
-	if any(token in txt for token in ["statistical", "linear regression", "logistic", "ridge", "lasso"]):
+	if not ml_explicit and any(token in txt for token in ["statistical", "linear regression", "logistic", "ridge", "lasso"]):
 		st.session_state.setdefault("model_selection_hint", {})
-		st.session_state["model_selection_hint"].update({"family": "Statistical", "flexible": True})
-		notes.append("Applied requirement: prefer Statistical models (hint set)")
+		st.session_state["model_selection_hint"].update({"family": "Statistical", "flexible": False})
+		current_problem_type = st.session_state.get("problem_type")
+		if "logistic" in txt:
+			chosen_model = "Logistic Regression"
+		elif "linear regression" in txt:
+			chosen_model = "Linear Regression"
+		elif "ridge" in txt:
+			chosen_model = "Ridge"
+		elif "lasso" in txt:
+			chosen_model = "Lasso"
+		elif current_problem_type == "regression":
+			chosen_model = "Linear Regression"
+		else:
+			chosen_model = "Logistic Regression"
+		st.session_state["model_family"] = "Statistical"
+		st.session_state["model_name"] = chosen_model
+		st.session_state["model_selection_hint"].update({"default_model": chosen_model})
+		notes.append(f"Applied requirement: use a statistical model (defaulted to {chosen_model})")
 
 	# Explicit model names
 	if "decision tree" in txt or "dtree" in txt or ("decision" in txt and "tree" in txt):
@@ -321,11 +555,13 @@ def apply_requirement_to_state(req_text: str) -> List[str]:
 		st.session_state.setdefault("model_family", "Statistical")
 		notes.append("Applied requirement: model_name = Linear Regression")
 
-	# If user asked to 'use any ML model', set a preference hint but do not hard-choose the model
-	if any(phrase in txt for phrase in ["use any ml model", "use any ml", "use an ml model"]):
+	# Keep a soft fallback for broad ML wording that still wasn't captured above.
+	if ml_explicit or any(phrase in txt for phrase in ["use any ml model", "use any ml", "use an ml model"]):
 		st.session_state.setdefault("model_selection_hint", {})
-		st.session_state["model_selection_hint"].update({"family": "ML", "flexible": True})
-		notes.append("Applied requirement: prefer ML models (no hard model selected)")
+		st.session_state["model_selection_hint"].update({"family": "ML", "flexible": True, "default_model": "Random Forest"})
+		st.session_state.setdefault("model_family", "ML")
+		st.session_state.setdefault("model_name", "Random Forest")
+		notes.append("Applied requirement: prefer ML models (default model available)")
 
 	# Performance / tradeoff hints
 	if any(token in txt for token in ["speed", "faster", "quick", "latency", "fast", "lightweight"]):
@@ -362,14 +598,34 @@ def update_preferences_from_text(
 	prefs: Dict[str, Any] = dict(current_preferences or {})
 	updates: List[str] = []
 	lower = (user_text or "").lower()
+	ml_explicit = any(_has_phrase(lower, phrase) for phrase in ["ml", "ml model", "machine learning", "machine learning model", "use an ml model", "use any ml model", "prefer ml model"])
 
 	# Model family hints
-	if any(tok in lower for tok in ["ml", "machine learning"]):
+	if ml_explicit:
 		prefs["preferred_model_family"] = "ML"
+		prefs["preferred_model_name"] = "Random Forest"
+		updates.append("Preference saved: prefer ML models and default to Random Forest")
+	elif any(tok in lower for tok in ["ml", "machine learning"]):
+		prefs["preferred_model_family"] = "ML"
+		prefs["preferred_model_name"] = "Random Forest"
 		updates.append("Preference saved: prefer ML models")
 
-	if any(tok in lower for tok in ["statistical", "linear regression", "logistic", "ridge", "lasso"]):
+	if not ml_explicit and any(tok in lower for tok in ["statistical", "linear regression", "logistic", "ridge", "lasso"]):
 		prefs["preferred_model_family"] = "Statistical"
+		current_problem_type = st.session_state.get("problem_type")
+		if "logistic" in lower:
+			prefs["preferred_model_name"] = "Logistic Regression"
+		elif "linear regression" in lower:
+			prefs["preferred_model_name"] = "Linear Regression"
+		elif "ridge" in lower:
+			prefs["preferred_model_name"] = "Ridge"
+		elif "lasso" in lower:
+			prefs["preferred_model_name"] = "Lasso"
+		elif current_problem_type == "regression":
+			prefs["preferred_model_name"] = "Linear Regression"
+		else:
+			prefs["preferred_model_name"] = "Logistic Regression"
+		updates.append("Preference saved: prefer Statistical models")
 		updates.append("Preference saved: prefer Statistical models")
 
 	# Problem type hints
@@ -498,13 +754,17 @@ def build_copilot_context(step: int, df: Optional[pd.DataFrame], summary: Any) -
 	warmup_context = st.session_state.get("rag_warmup_context")
 	if warmup_context:
 		parts.append(f"RAG warmup: {warmup_context}")
+	parts.append(build_supported_tool_summary())
 	conversation_memory = format_conversation_memory_for_context(st.session_state.get("agent_conversation_memory"))
 	if conversation_memory:
 		parts.append(f"Conversation memory: {conversation_memory}")
 	# System policy: treat requirement-style chat messages as record-only.
 	parts.append(
 		"System policy: Auto AI records requirement-style chat messages and selects actions for the workflow."
+		" Treat explicit requirements and constraints as record-only, but keep question-like or advice-seeking messages as questions."
 		" Acknowledge requirements with a short 'Noted' and record them. Do not mention which model is speaking."
+		" Match statistical questions to the supported diagnostic by intent, not just by exact tool name; for example, 'normally distributed' maps to normality analysis (Shapiro-Wilk/Jarque-Bera)."
+		" Likewise, 'constant variance', 'homoscedasticity', or 'heteroskedasticity' map to heteroscedasticity analysis."
 		" Avoid self-interpretations such as 'the user wants'. Do not echo internal planning JSON or tool payloads."
 		" Use neutral phrasing, answer with the result first, keep replies short, and ask clarifying questions only when the user explicitly requests a recommendation or asks a question."
 	)
@@ -633,11 +893,16 @@ def build_dataset_analysis_context(
 	bundle = get_or_build_dataset_readiness_bundle(df, summary, target_col=target_col)
 	analysis = bundle.get("eda") or perform_eda(df, target_col=target_col)
 	model_setup = bundle.get("model_setup") or recommend_model_setup(df, target_col=target_col)
-	on_demand_tools = run_statistical_tools_on_demand(df, user_text=user_text, target_col=target_col)
+	unsupported_request = is_unsupported_statistical_request(user_text)
+	statistical_request = is_statistical_diagnostic_request(user_text)
+	on_demand_tools = {} if unsupported_request else run_statistical_tools_on_demand(df, user_text=user_text, target_col=target_col)
 	compact = {
 		"step": step,
 		"user_question": user_text,
 		"target_col": target_col,
+		"supported_tools": get_supported_tool_inventory(),
+		"unsupported_request": unsupported_request,
+		"statistical_request": statistical_request,
 		"profile": analysis.get("profile", {}),
 		"problem_type": analysis.get("problem_type"),
 		"recommended_sections": analysis.get("recommended_sections", []),

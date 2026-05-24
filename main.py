@@ -91,6 +91,7 @@ from ai_agent.copilot_utils import (
 	build_dataset_readiness_bundle,
 	build_meta_help_reply,
 	build_dataset_analysis_context,
+	build_unsupported_tool_reply,
 	condense_user_facing_text,
 	sanitize_user_facing_text,
 	strip_internal_plan_payload,
@@ -102,6 +103,8 @@ from ai_agent.copilot_utils import (
 	is_meta_help_request,
 	is_requirement_message,
 	is_dataset_question,
+	is_unsupported_statistical_request,
+	is_statistical_diagnostic_request,
 )
 from ai_agent.rag_store import build_workflow_rag_context
 
@@ -115,10 +118,14 @@ def init_state() -> None:
 		st.session_state["df_original"] = None
 	if "df_cleaned" not in st.session_state:
 		st.session_state["df_cleaned"] = None
+	if "df_outlier_cleaned" not in st.session_state:
+		st.session_state["df_outlier_cleaned"] = None
 	if "summary" not in st.session_state:
 		st.session_state["summary"] = None
 	if "summary_cleaned" not in st.session_state:
 		st.session_state["summary_cleaned"] = None
+	if "summary_outlier_cleaned" not in st.session_state:
+		st.session_state["summary_outlier_cleaned"] = None
 	if "llm_text" not in st.session_state:
 		st.session_state["llm_text"] = None
 	if "results" not in st.session_state:
@@ -179,8 +186,10 @@ def clear_workflow_state(keep_original: bool = True) -> None:
 	keys_to_clear = [
 		"df",
 		"df_cleaned",
+		"df_outlier_cleaned",
 		"summary",
 		"summary_cleaned",
+		"summary_outlier_cleaned",
 		"llm_text",
 		"results",
 		"results_tuned",
@@ -188,6 +197,9 @@ def clear_workflow_state(keep_original: bool = True) -> None:
 		"model_reco",
 		"cleaning_applied",
 		"cleaning_confirmed",
+		"cleaning_review_note",
+		"outlier_strategy",
+		"outlier_remove_cols",
 		"step1_state",
 		"step2_state",
 		"step3_state",
@@ -213,7 +225,6 @@ def clear_workflow_state(keep_original: bool = True) -> None:
 		keys_to_clear.append("df_cleaned")
 	step3_widget_keys = [
 		"target_col",
-		"target_missing",
 		"problem_type",
 		"use_modeling",
 		"model_reco",
@@ -265,6 +276,81 @@ def clear_workflow_state(keep_original: bool = True) -> None:
 		if key.startswith("feature_") or key.startswith("tuned_"):
 			del st.session_state[key]
 	st.session_state["step"] = 0
+
+
+def _get_cleaning_source_df() -> pd.DataFrame:
+	for key in ("df_outlier_cleaned", "df_original", "df"):
+		value = st.session_state.get(key)
+		if value is not None:
+			return value
+	return None
+
+
+def _set_cleaning_source_df(cleaned_df: pd.DataFrame, note: str) -> None:
+	st.session_state["df_outlier_cleaned"] = cleaned_df
+	st.session_state["summary_outlier_cleaned"] = build_summary(cleaned_df)
+	st.session_state["df_cleaned"] = None
+	st.session_state["summary_cleaned"] = None
+	st.session_state["cleaning_applied"] = False
+	st.session_state["cleaning_confirmed"] = False
+	prior_note = str(st.session_state.get("cleaning_review_note", "")).strip()
+	st.session_state["cleaning_review_note"] = f"{prior_note} {note}".strip() if prior_note else note
+
+
+def _finalize_cleaned_dataset(cleaned_df: pd.DataFrame, cleaned_summary: Any, note: str) -> None:
+	st.session_state["df_cleaned"] = cleaned_df
+	st.session_state["summary_cleaned"] = cleaned_summary
+	st.session_state["df"] = cleaned_df
+	st.session_state["summary"] = cleaned_summary
+	st.session_state["cleaning_applied"] = True
+	st.session_state["cleaning_confirmed"] = False
+	prior_note = str(st.session_state.get("cleaning_review_note", "")).strip()
+	st.session_state["cleaning_review_note"] = f"{prior_note} {note}".strip() if prior_note else note
+
+
+def _apply_cleaning_preferences(base_df: pd.DataFrame, keep_outliers: bool, outlier_cols: List[str], missing_strategy: str, numeric_strategy: str, impute_categorical: bool) -> None:
+	work_df = base_df.copy()
+	strategy = "Keep outliers"
+	outlier_note = "Kept outliers."
+	if not keep_outliers and outlier_cols:
+		work_df, removed_rows = remove_iqr_outliers(work_df, outlier_cols)
+		strategy = "Remove selected outlier columns"
+		outlier_note = f"Removed outliers from {', '.join(outlier_cols)} ({removed_rows} rows removed)."
+	st.session_state["df_outlier_cleaned"] = work_df
+	st.session_state["summary_outlier_cleaned"] = build_summary(work_df)
+	st.session_state["outlier_strategy"] = strategy
+	st.session_state["outlier_remove_cols"] = list(outlier_cols)
+	if missing_strategy == "drop":
+		final_df = work_df.dropna()
+		missing_note = "Applied drop for missing values."
+	else:
+		final_df = impute_missing_values(
+			work_df,
+			numeric_strategy=numeric_strategy,
+			impute_categorical=impute_categorical,
+		)
+		missing_note = f"Applied {numeric_strategy}/mode imputation for missing values."
+	combined_note = f"{outlier_note} {missing_note}".strip()
+	st.session_state["cleaning_review_note"] = ""
+	_finalize_cleaned_dataset(final_df, build_summary(final_df), combined_note)
+
+
+def _apply_auto_review_and_skip_to_modeling(step: int) -> None:
+	if not st.session_state.get("agent_auto_mode", False):
+		return
+	run_step_auto_actions(1)
+	run_step_auto_actions(2)
+	cleaned_df = st.session_state.get("df_cleaned")
+	cleaned_summary = st.session_state.get("summary_cleaned")
+	if cleaned_df is not None and cleaned_summary is not None:
+		st.session_state["df"] = cleaned_df
+		st.session_state["summary"] = cleaned_summary
+		st.session_state["cleaning_confirmed"] = True
+		st.session_state["analysis_ready"] = True
+		st.session_state["analysis_ready_message"] = "Auto AI completed cleaning and moved directly to modeling review."
+	st.session_state["step"] = 3
+	st.session_state["scroll_to_top"] = True
+	st.rerun()
 
 
 def add_agent_activity(message: str, level: str = "info") -> None:
@@ -472,7 +558,7 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 		st.caption(f"Hint: {rule_or_hybrid_hint}")
 
 		if st.session_state.get("agent_auto_mode", False):
-			add_agent_activity("Suggestions only. Auto AI will not advance steps; use Continue when ready.")
+			st.caption("Auto AI can fast-path to modeling review while keeping cleaning decisions visible there.")
 			last_applied = st.session_state.get("agent_auto_last_applied", [])
 			if last_applied:
 				st.caption(f"Applied suggestions: {', '.join(last_applied[:5])}")
@@ -528,13 +614,18 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 						add_agent_activity("Auto AI recorded the requirement.")
 						# Keep the user's goal recorded but do not prompt the LLM.
 						st.session_state["agent_goal"] = user_text
+					elif is_unsupported_statistical_request(user_text):
+						reply = build_unsupported_tool_reply(user_text)
+						add_chat_message("assistant", reply)
+						update_conversation_memory_from_assistant(reply)
+						add_agent_activity("Unsupported statistical request redirected to available tools.")
 					else:
 						with st.spinner("AI thinking..."):
 							context = build_copilot_context(step, df, summary)
 							dataset_question = is_dataset_question(user_text, step, df, summary)
 							if is_meta_help_request(user_text):
 								reply = build_meta_help_reply(user_text, st.session_state.get("agent_goal", ""))
-							elif dataset_question:
+							elif dataset_question or is_statistical_diagnostic_request(user_text):
 								dataset_context = build_dataset_analysis_context(step, df, summary, user_text)
 								prompt = (
 									"You are Auto AI. Give the final recommendation first. "
@@ -1600,7 +1691,7 @@ def run_modeling_flow(settings: Dict[str, Any]) -> Dict[str, Any]:
 		df,
 		target_col=target_col,
 		problem_type=problem_type,
-		target_missing=settings["target_missing"],
+		target_missing=settings.get("target_missing", "drop"),
 	)
 	if error:
 		return {"error": error}
@@ -1814,9 +1905,12 @@ def main() -> None:
 		col_a, col_b = st.columns([1, 1])
 		with col_b:
 			if st.button("Continue"):
-				st.session_state["step"] = 1
-				st.session_state["scroll_to_top"] = True
-				st.rerun()
+				if st.session_state.get("agent_auto_mode", False):
+					_apply_auto_review_and_skip_to_modeling(0)
+				else:
+					st.session_state["step"] = 1
+					st.session_state["scroll_to_top"] = True
+					st.rerun()
 
 		# Try autorun actions for current step if enabled (non-blocking)
 		run_step_auto_actions(st.session_state.get("step", 0))
@@ -1832,8 +1926,6 @@ def main() -> None:
 				"eda_show_target_dist",
 				"eda_show_target_rel",
 				"eda_show_pairplot",
-				"eda_show_outliers",
-				"eda_outlier_remove_cols",
 				"eda_target_col",
 				"eda_numeric_column",
 				"eda_target_feature",
@@ -1858,7 +1950,6 @@ def main() -> None:
 			st.checkbox("Target distribution", key="eda_show_target_dist")
 			st.checkbox("Target vs feature", key="eda_show_target_rel")
 			st.checkbox("Pairplot (sampled)", key="eda_show_pairplot")
-			st.checkbox("Outlier summary", key="eda_show_outliers")
 
 		if st.session_state.get("eda_show_summary"):
 			st.subheader("Summary Statistics")
@@ -1920,27 +2011,6 @@ def main() -> None:
 			st.subheader("Pairplot (Sampled)")
 			render_pairplot(df, summary.numeric_cols)
 
-		if st.session_state.get("eda_show_outliers"):
-			st.subheader("Outlier Summary")
-			render_outlier_summary(df, summary.numeric_cols)
-			outlier_counts = count_iqr_outliers(df, summary.numeric_cols)
-			if not outlier_counts.empty:
-				st.multiselect(
-					"Remove outlier columns",
-					outlier_counts["column"].tolist(),
-					key="eda_outlier_remove_cols",
-				)
-				if st.button("Apply outlier removal"):
-					selected_cols = st.session_state.get("eda_outlier_remove_cols", [])
-					updated_df, _ = remove_iqr_outliers(df, selected_cols)
-					st.session_state["df"] = updated_df
-					st.session_state["summary"] = build_summary(updated_df)
-					st.session_state["df_cleaned"] = None
-					st.session_state["summary_cleaned"] = None
-					st.session_state["cleaning_applied"] = False
-					st.session_state["cleaning_confirmed"] = False
-					st.rerun()
-
 		save_widget_state(
 			"step1_state",
 			[
@@ -1951,8 +2021,6 @@ def main() -> None:
 				"eda_show_target_dist",
 				"eda_show_target_rel",
 				"eda_show_pairplot",
-				"eda_show_outliers",
-					"eda_outlier_remove_cols",
 				"eda_target_col",
 				"eda_numeric_column",
 				"eda_target_feature",
@@ -1967,17 +2035,23 @@ def main() -> None:
 				st.rerun()
 		with col_b:
 			if st.button("Continue"):
-				if df is not None and has_missing_values(df):
-					st.session_state["step"] = 2
+				if st.session_state.get("agent_auto_mode", False):
+					_apply_auto_review_and_skip_to_modeling(1)
 				else:
-					st.session_state["step"] = 3
-				st.session_state["scroll_to_top"] = True
-				st.rerun()
+					outlier_counts = count_iqr_outliers(df, summary.numeric_cols)
+					if (outlier_counts is not None and not outlier_counts.empty) or (df is not None and has_missing_values(df)):
+						st.session_state["step"] = 2
+					else:
+						st.session_state["step"] = 3
+					st.session_state["scroll_to_top"] = True
+					st.rerun()
 
 	elif st.session_state["step"] == 2:
 		restore_widget_state(
 			"step2_state",
 			[
+				"outlier_strategy",
+				"outlier_remove_cols",
 				"missing_strategy",
 				"numeric_impute_strategy",
 				"impute_categorical",
@@ -1994,11 +2068,51 @@ def main() -> None:
 		run_step_auto_actions(2)
 
 		st.subheader("Data Cleaning")
-		st.caption("Handle missing values only. Outliers are managed in EDA.")
+		st.caption("Review outliers first, then choose how to handle missing values before modeling.")
 		render_system_message("Data Cleaning", summary)
 
+		source_df = _get_cleaning_source_df()
+		if source_df is None:
+			source_df = df_original
+		source_summary = build_summary(source_df)
+
+		st.subheader("Outlier Review")
+		outlier_counts = count_iqr_outliers(source_df, source_summary.numeric_cols)
+		if not outlier_counts.empty:
+			render_outlier_summary(source_df, source_summary.numeric_cols)
+			st.dataframe(outlier_counts, use_container_width=True, hide_index=True)
+			outlier_strategy = st.radio(
+				"Outlier action",
+				["Keep outliers", "Remove selected outlier columns"],
+				horizontal=True,
+				key="outlier_strategy",
+			)
+			if outlier_strategy == "Remove selected outlier columns":
+				selected_outlier_cols = st.multiselect(
+					"Columns to remove based on outliers",
+					outlier_counts["column"].tolist(),
+					key="outlier_remove_cols",
+				)
+				if st.button("Apply outlier decision"):
+					if not selected_outlier_cols:
+						st.warning("Select at least one outlier column or keep the outliers.")
+					else:
+						updated_df, removed_rows = remove_iqr_outliers(source_df, selected_outlier_cols)
+						note = f"Removed outliers from {', '.join(selected_outlier_cols)} ({removed_rows} rows removed)."
+						_set_cleaning_source_df(updated_df, note)
+						source_df = updated_df
+						source_summary = build_summary(updated_df)
+						st.success(note)
+			elif not str(st.session_state.get("cleaning_review_note", "")).strip():
+				st.session_state["cleaning_review_note"] = "Kept detected outliers for review."
+		else:
+			st.info("No outliers detected in numeric columns.")
+			st.session_state["outlier_strategy"] = "Keep outliers"
+			st.session_state["outlier_remove_cols"] = []
+			st.session_state["cleaning_review_note"] = "No outliers detected."
+
 		st.subheader("Missing Value Imputation")
-		missing_table = df_original.isna().sum().reset_index()
+		missing_table = source_df.isna().sum().reset_index()
 		missing_table.columns = ["column", "missing_count"]
 		st.dataframe(missing_table, use_container_width=True)
 		missing_strategy = st.radio(
@@ -2022,19 +2136,18 @@ def main() -> None:
 			)
 
 		if st.button("Apply cleaning"):
-			work_df = df_original.copy()
+			work_df = source_df.copy()
 			if missing_strategy == "drop":
 				work_df = work_df.dropna()
+				note = "Applied drop for missing values."
 			else:
 				work_df = impute_missing_values(
 					work_df,
 					numeric_strategy=numeric_strategy,
 					impute_categorical=impute_categorical,
 				)
-			st.session_state["df_cleaned"] = work_df
-			st.session_state["summary_cleaned"] = build_summary(work_df)
-			st.session_state["cleaning_applied"] = True
-			st.session_state["cleaning_confirmed"] = False
+				note = f"Applied {numeric_strategy}/mode imputation for missing values."
+			_finalize_cleaned_dataset(work_df, build_summary(work_df), note)
 			st.success("Cleaning applied.")
 
 		cleaned_df = st.session_state.get("df_cleaned")
@@ -2044,22 +2157,18 @@ def main() -> None:
 			col_left, col_right = st.columns(2)
 			with col_left:
 				st.caption("Before")
-				st.write(f"Rows: {summary.rows} | Columns: {summary.cols}")
-				st.dataframe(summary.missing_by_col, use_container_width=True)
-				st.dataframe(df_original.head(10), use_container_width=True)
+				st.write(f"Rows: {source_summary.rows} | Columns: {source_summary.cols}")
+				st.dataframe(source_summary.missing_by_col, use_container_width=True)
+				st.dataframe(source_df.head(10), use_container_width=True)
 			with col_right:
 				st.caption("After")
 				st.write(f"Rows: {cleaned_summary.rows} | Columns: {cleaned_summary.cols}")
 				st.dataframe(cleaned_summary.missing_by_col, use_container_width=True)
 				st.dataframe(cleaned_df.head(10), use_container_width=True)
 
-		confirm_clean = st.checkbox(
-			"Confirm cleaned data and proceed to modeling",
-			key="cleaning_confirmed_display",
-		)
 		if st.button("Proceed to modeling"):
-			candidate_df = cleaned_df if cleaned_df is not None else df_original
-			candidate_summary = cleaned_summary if cleaned_summary is not None else summary
+			candidate_df = cleaned_df if cleaned_df is not None else source_df
+			candidate_summary = cleaned_summary if cleaned_summary is not None else source_summary
 			if candidate_df.isna().any().any():
 				st.error("Resolve missing values before proceeding to modeling.")
 			else:
@@ -2080,12 +2189,13 @@ def main() -> None:
 		save_widget_state(
 			"step2_state",
 			[
+				"outlier_strategy",
+				"outlier_remove_cols",
 				"missing_strategy",
 				"numeric_impute_strategy",
 				"impute_categorical",
 				"cleaning_applied",
 				"cleaning_confirmed",
-				"cleaning_confirmed_display",
 			],
 		)
 		st.stop()
@@ -2093,7 +2203,6 @@ def main() -> None:
 	elif st.session_state["step"] == 3:
 		step3_keys = [
 			"target_col",
-			"target_missing",
 			"problem_type",
 			"use_modeling",
 			"model_reco",
@@ -2154,17 +2263,32 @@ def main() -> None:
 			st.stop()
 		run_step_auto_actions(3)
 		render_system_message("Modeling Setup", summary)
+		cleaning_note = st.session_state.get("cleaning_review_note")
+		if cleaning_note:
+			st.info(f"Cleaning decisions: {cleaning_note}")
+
+		outlier_cols = [col for col in st.session_state.get("outlier_remove_cols", []) if col in df.columns]
+		if outlier_cols:
+			st.subheader("Outlier Decision")
+			current_keep = st.session_state.get("outlier_strategy", "Keep outliers") == "Keep outliers"
+			keep_outliers = st.checkbox("Keep outliers", value=current_keep, key="outlier_keep_choice")
+			st.caption(f"AI recommendation: {st.session_state.get('outlier_strategy', 'Keep outliers')} for {', '.join(outlier_cols)}.")
+			if keep_outliers != current_keep:
+				_apply_cleaning_preferences(
+					df_original,
+					keep_outliers=keep_outliers,
+					outlier_cols=outlier_cols,
+					missing_strategy=st.session_state.get("missing_strategy", "impute"),
+					numeric_strategy=st.session_state.get("numeric_impute_strategy", "median"),
+					impute_categorical=st.session_state.get("impute_categorical", True),
+				)
+				st.session_state["step"] = 3
+				st.session_state["scroll_to_top"] = True
+				st.rerun()
 
 		st.subheader("Problem Setup")
 		normalize_selector_state("target_col", list(df.columns), default=df.columns[0] if len(df.columns) else None)
 		target_col = st.selectbox("Target column", df.columns, key="target_col")
-		normalize_selector_state("target_missing", ["drop", "error (stop if missing)"], default="drop")
-		target_missing = st.selectbox(
-			"Target missing values",
-			["drop", "error (stop if missing)"],
-			key="target_missing",
-		)
-		missing_mode = "drop" if target_missing == "drop" else "error"
 
 		problem_options = ["classification", "regression"]
 		if summary.datetime_cols:
@@ -2173,8 +2297,19 @@ def main() -> None:
 		problem_type = st.selectbox("Problem type", problem_options, key="problem_type")
 
 		preferred_model_family = st.session_state.get("agent_preferences", {}).get("preferred_model_family")
-		if preferred_model_family in ["Statistical", "ML"] and "model_family" not in st.session_state:
-			st.session_state["model_family"] = preferred_model_family
+		preferred_model_name = st.session_state.get("agent_preferences", {}).get("preferred_model_name")
+		if preferred_model_family in ["Statistical", "ML"]:
+			if st.session_state.get("model_family") not in ["Statistical", "ML"]:
+				st.session_state["model_family"] = preferred_model_family
+			elif st.session_state.get("model_family") != preferred_model_family:
+				st.session_state["model_family"] = preferred_model_family
+		preferred_name_family = None
+		if preferred_model_name in (ML_CLASSIFICATION_MODELS + ML_REGRESSION_MODELS):
+			preferred_name_family = "ML"
+		elif preferred_model_name in (STATISTICAL_CLASSIFICATION_MODELS + STATISTICAL_REGRESSION_MODELS):
+			preferred_name_family = "Statistical"
+		if preferred_model_name and (preferred_model_family is None or preferred_name_family == preferred_model_family):
+			st.session_state["model_name"] = preferred_model_name
 
 		normalize_selector_state("use_modeling", ["Yes", "No (EDA only)"], default="Yes")
 		use_modeling = st.radio(
@@ -2718,7 +2853,6 @@ def main() -> None:
 						"tpe_trials": tpe_trials,
 						"manual_params": manual_params,
 						"max_rows": max_rows,
-						"target_missing": missing_mode,
 					}
 				)
 				if results.get("error"):

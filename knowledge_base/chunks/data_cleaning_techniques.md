@@ -10,6 +10,7 @@ summary: Step-2 cleaning policy with deterministic defaults and explicit techniq
 Use this chunk for Step 2 only.
 
 Primary cleaning goals:
+- Review outliers before missing-value handling.
 - Resolve missing values safely.
 - Keep feature meaning where possible.
 - Avoid destructive cleaning unless user asks.
@@ -32,7 +33,10 @@ When to prefer each option:
 
 Outlier handling policy:
 - Detect outliers for review first.
-- Do not remove outliers automatically unless user explicitly requests removal.
+- Prefer keeping outliers when the values look plausible, sparse, or domain-relevant.
+- Remove outliers only when they look like clear errors, impossible values, or concentrated measurement artifacts.
+- Let the user keep or remove detected outliers in the cleaning step before missing-value handling.
+- If auto mode makes an outlier decision, surface it in modeling with a reversible keep/remove control.
 
 Time-related columns:
 - Preserve datetime columns by default.

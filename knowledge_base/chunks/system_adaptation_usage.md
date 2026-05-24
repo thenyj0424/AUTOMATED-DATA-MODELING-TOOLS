@@ -13,6 +13,10 @@ Blocked keys (never set):
 - analysis_ready
 
 Step-2 cleaning keys:
+- outlier_strategy: Keep outliers | Remove selected outlier columns
+- outlier_remove_cols: list of column names
+- df_outlier_cleaned: dataframe after outlier review
+- summary_outlier_cleaned: summary after outlier review
 - missing_strategy: impute | drop
 - numeric_impute_strategy: median | mean
 - impute_categorical: true | false

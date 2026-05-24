@@ -1,7 +1,7 @@
 from typing import Dict, Any, Tuple, List, Optional
 import json
 import pandas as pd
-from ai_agent.data_utils import impute_missing_values, build_summary, count_iqr_outliers
+from ai_agent.data_utils import impute_missing_values, build_summary, count_iqr_outliers, remove_iqr_outliers
 from ai_agent.llm_client import call_groq, groq_token_loaded, DEFAULT_REASONER_MODEL
 from ai_agent.rag_store import build_workflow_rag_context
 from ai_agent.copilot_utils import infer_time_series_configuration
@@ -85,6 +85,32 @@ def _is_useless_feature(col: str, dtype_name: str) -> bool:
     if "datetime" in dtype_name or "datetimetz" in dtype_name:
         return True
     return any(token in name for token in tokens)
+
+
+def _recommend_outlier_action(df: pd.DataFrame, outlier_counts: pd.DataFrame) -> Tuple[str, List[str], str]:
+    if outlier_counts.empty:
+        return "Keep outliers", [], "No outliers detected."
+
+    rows = max(int(len(df)), 1)
+    top_columns = outlier_counts.head(3)["column"].astype(str).tolist()
+    remove_cols: List[str] = []
+    measurement_tokens = ["cm", "mm", "width", "height", "length", "age", "weight", "price", "income", "salary", "amount", "score", "count"]
+
+    for _, row in outlier_counts.iterrows():
+        column = str(row["column"])
+        count = int(row["outlier_count"])
+        ratio = count / rows
+        lower_name = column.lower()
+        measurement_like = any(token in lower_name for token in measurement_tokens)
+        if ratio >= 0.15 or (measurement_like and (ratio >= 0.05 or count >= 5)):
+            remove_cols.append(column)
+
+    if remove_cols:
+        reason = f"Recommended removal for {', '.join(remove_cols)} because the outliers are concentrated in measurement-like columns."
+        return "Remove selected outlier columns", remove_cols, reason
+
+    reason = f"Recommended keeping {', '.join(top_columns)} because the outliers look sparse and may be valid variation."
+    return "Keep outliers", top_columns, reason
 
 
 def _normalize_request_text(text: str) -> str:
@@ -396,10 +422,22 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
             summary = build_summary(df)
             outlier_counts = count_iqr_outliers(df, summary.numeric_cols)
             if not outlier_counts.empty:
-                top_outliers = outlier_counts.head(3)["column"].tolist()
-                activities.append(
-                    "Outliers detected in: " + ", ".join(top_outliers) + ". Review the outlier summary before deciding whether to remove them."
-                )
+                top_outliers = outlier_counts.head(3)["column"].astype(str).tolist()
+                recommendation, recommended_cols, reason = _recommend_outlier_action(df, outlier_counts)
+                note = f"Outliers detected in: {', '.join(top_outliers)}. Recommended action: {recommendation.lower()}. {reason}"
+                activities.append(note)
+                changes.setdefault("cleaning_review_note", note)
+                changes.setdefault("outlier_strategy", recommendation)
+                changes.setdefault("outlier_remove_cols", recommended_cols if recommended_cols else top_outliers)
+                changes.setdefault("outlier_decision_reason", reason)
+                if recommendation == "Remove selected outlier columns" and recommended_cols:
+                    cleaned_df, removed_rows = remove_iqr_outliers(df, recommended_cols)
+                    changes["df_outlier_cleaned"] = cleaned_df
+                    changes["summary_outlier_cleaned"] = build_summary(cleaned_df)
+                    activities.append(f"Applied recommended outlier removal for {', '.join(recommended_cols)} ({removed_rows} rows removed).")
+                else:
+                    changes["df_outlier_cleaned"] = df.copy()
+                    changes["summary_outlier_cleaned"] = summary
 
     elif step == 2:
         # suggest imputation preview
@@ -409,12 +447,19 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
             changes["numeric_impute_strategy"] = "median"
         if "impute_categorical" not in state and "impute_categorical" not in changes:
             changes["impute_categorical"] = True
-        if "df_cleaned" not in state and "df_cleaned" not in changes and df is not None:
-            cleaned = impute_missing_values(df.copy(), numeric_strategy="median", impute_categorical=True)
+        base_df = state.get("df_outlier_cleaned") if state.get("df_outlier_cleaned") is not None else df
+        if "df_cleaned" not in state and "df_cleaned" not in changes and base_df is not None:
+            cleaned = impute_missing_values(base_df.copy(), numeric_strategy="median", impute_categorical=True)
             changes["df_cleaned"] = cleaned
             changes["summary_cleaned"] = build_summary(cleaned)
             changes["cleaning_applied"] = True
-            activities.append("Suggested median/mode imputation for missing values (preview).")
+            missing_note = "Suggested median/mode imputation for missing values (preview)."
+            prior_note = str(state.get("cleaning_review_note", "")).strip()
+            if prior_note:
+                changes["cleaning_review_note"] = f"{prior_note} {missing_note}"
+            else:
+                changes["cleaning_review_note"] = missing_note
+            activities.append(missing_note)
 
     elif step == 3:
         # prepare default modeling choices
@@ -436,6 +481,12 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
             req_blob = " ".join(req_texts).lower()
             preferences = state.get("agent_preferences") or {}
             preferred_family = preferences.get("preferred_model_family")
+            preferred_model_name = preferences.get("preferred_model_name")
+            preferred_model_name_family = None
+            if preferred_model_name in (ML_CLASSIFICATION_MODELS + ML_REGRESSION_MODELS):
+                preferred_model_name_family = "ML"
+            elif preferred_model_name in (STATISTICAL_CLASSIFICATION_MODELS + STATISTICAL_REGRESSION_MODELS):
+                preferred_model_name_family = "Statistical"
             if "problem_type" not in state and "problem_type" not in changes:
                 changes["problem_type"] = problem_type
 
@@ -461,8 +512,11 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
                     else:
                         changes["model_family"] = "Statistical" if problem_type == "classification" and len(df.columns) <= 15 else "ML"
                 if "model_name" not in state and "model_name" not in changes:
+                    if preferred_model_name and (preferred_family is None or preferred_model_name_family == preferred_family):
+                        changes["model_name"] = preferred_model_name
+                        activities.append(f"Applied user preference for model name: {preferred_model_name}.")
                     # Honor explicit requirement for decision tree if requested by user
-                    if "decision tree" in req_blob or "decision-tree" in req_blob or ("decision" in req_blob and "tree" in req_blob):
+                    elif "decision tree" in req_blob or "decision-tree" in req_blob or ("decision" in req_blob and "tree" in req_blob):
                         changes["model_name"] = "Decision Tree"
                         changes.setdefault("model_family", "ML")
                         activities.append("Applied user requirement: Decision Tree model.")
