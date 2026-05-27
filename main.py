@@ -608,15 +608,22 @@ def render_agent_shell(step: int, df: Optional[pd.DataFrame], summary: Any) -> N
 						reqs = st.session_state.get("agent_requirements", [])
 						reqs.insert(0, {"text": user_text, "time": datetime.now().isoformat()})
 						st.session_state["agent_requirements"] = reqs[:50]
-						requirement_reply = "Noted. Requirement recorded."
-						add_chat_message("assistant", requirement_reply)
-						update_conversation_memory_from_assistant(requirement_reply)
 						# Parse and apply the requirement to session state so subsequent choices honor it.
 						from ai_agent.copilot_utils import apply_requirement_to_state
 						applied_notes = apply_requirement_to_state(user_text)
 						for note in applied_notes:
 							add_agent_activity(note)
 						add_agent_activity("Auto AI recorded the requirement.")
+						applied = any(str(note).lower().startswith("applied requirement") for note in applied_notes)
+						failed_notes = [note for note in applied_notes if str(note).lower().startswith("requirement not applied")]
+						if failed_notes:
+							requirement_reply = str(failed_notes[0])
+						elif applied:
+							requirement_reply = "Noted. Requirement applied."
+						else:
+							requirement_reply = "I could not apply that requirement. Please specify a supported option."
+						add_chat_message("assistant", requirement_reply)
+						update_conversation_memory_from_assistant(requirement_reply)
 						# Keep the user's goal recorded but do not prompt the LLM.
 						st.session_state["agent_goal"] = user_text
 					elif is_unsupported_statistical_request(user_text):
@@ -814,7 +821,8 @@ def build_auto_mode_prompt(
 		"the fixed workflow, or the uploaded data constraints. If the request is vague, use the KB guidance. "
 		"Use the KB as the secondary source and keep recommendations compatible with the current step. "
 		"Return JSON only using this schema: {\"changes\": {\"key\": value}, \"activities\": [\"short note\"], \"priority_source\": \"user|kb|dataset\"}. "
-		"Only suggest supported session keys and never include control-flow keys.\n"
+		"Only suggest supported session keys and never include control-flow keys. "
+		"If a user request is unsupported or incompatible, include a short activity note explaining why and do not set that key.\n"
 		f"Context: {json.dumps(base_focus, ensure_ascii=True)}\n"
 		f"Knowledge base guidance:\n{kb_context or '(no kb context available)'}"
 	)

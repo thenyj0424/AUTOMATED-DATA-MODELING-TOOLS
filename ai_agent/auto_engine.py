@@ -170,6 +170,56 @@ def _extract_explicit_model(req_texts: List[str]) -> Tuple[Optional[str], Option
     return None, None
 
 
+def _extract_feature_selection_request(req_texts: List[str]) -> Tuple[Dict[str, Any], Optional[str]]:
+    for text in req_texts:
+        request = _normalize_request_text(text)
+        compact = request.replace(" ", "")
+        if any(phrase in request for phrase in ["no feature selection", "disable feature selection", "feature selection none"]):
+            return {"feature_selection": "None"}, "Applied requirement: feature_selection = None"
+        if "rfe" in request:
+            return {"feature_selection": "RFE"}, "Applied requirement: feature_selection = RFE"
+        if "selectkbest" in compact or "select k best" in request or "k best" in request:
+            return {"feature_selection": "SelectKBest"}, "Applied requirement: feature_selection = SelectKBest"
+        if "model based" in request or "model-based" in request:
+            changes = {"feature_selection": "Model-based"}
+            if any(token in request for token in ["lasso", "l1"]):
+                changes["model_based"] = "L1/Lasso"
+            elif any(token in request for token in ["tree", "importance"]):
+                changes["model_based"] = "Tree importance"
+            note = "Applied requirement: feature_selection = Model-based"
+            return changes, note
+        if "stepwise" in request:
+            changes = {"feature_selection": "Stepwise"}
+            if "backward" in request:
+                changes["stepwise_direction"] = "backward"
+            elif any(token in request for token in ["bidirectional", "both"]):
+                changes["stepwise_direction"] = "bidirectional"
+            else:
+                changes["stepwise_direction"] = "forward"
+            note = "Applied requirement: feature_selection = Stepwise"
+            return changes, note
+        if any(token in request for token in ["feature selection", "feature selector", "feature-selection"]):
+            return {}, "Requirement not applied: feature selection option not recognized."
+    return {}, None
+
+
+def _extract_tuning_request(req_texts: List[str]) -> Tuple[Dict[str, Any], Optional[str]]:
+    for text in req_texts:
+        request = _normalize_request_text(text)
+        compact = request.replace(" ", "")
+        if any(phrase in request for phrase in ["no tuning", "disable tuning", "tuning none", "no hyperparameter tuning"]):
+            return {"tuning_method": "None"}, "Applied requirement: tuning_method = None"
+        if "grid search" in request or "gridsearch" in compact:
+            return {"tuning_method": "Grid Search"}, "Applied requirement: tuning_method = Grid Search"
+        if "optuna" in request or "tpe" in request:
+            return {"tuning_method": "TPE (Optuna)"}, "Applied requirement: tuning_method = TPE (Optuna)"
+        if "manual" in request:
+            return {"tuning_method": "Manual"}, "Applied requirement: tuning_method = Manual"
+        if "tuning" in request or "hyperparameter" in request:
+            return {"tuning_method": "Grid Search"}, "Applied requirement: tuning_method = Grid Search"
+    return {}, None
+
+
 def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFrame) -> Tuple[Dict[str, Any], List[str]]:
     """Compute a dict of session keys -> new values to apply as non-destructive auto actions.
     Returns (changes, activity_messages). Does NOT mutate the input state.
@@ -267,12 +317,26 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
                     break
             has_time_series_request = bool(explicit_time_series_changes)
             explicit_model, explicit_family = _extract_explicit_model(req_texts)
+            feature_changes, feature_note = _extract_feature_selection_request(req_texts)
+            tuning_changes, tuning_note = _extract_tuning_request(req_texts)
 
             if explicit_model:
                 ai_changes["model_name"] = explicit_model
                 ai_changes["model_family"] = explicit_family or ai_changes.get("model_family", "ML")
                 ai_changes.setdefault("proceed_model", True)
                 ai_activities.append(f"Applied explicit user requirement: {explicit_model}.")
+            if feature_changes:
+                ai_changes.update(feature_changes)
+                ai_changes.setdefault("proceed_model", True)
+                if feature_note:
+                    ai_activities.append(feature_note)
+            elif feature_note:
+                ai_activities.append(feature_note)
+            if tuning_changes:
+                ai_changes.update(tuning_changes)
+                ai_changes.setdefault("proceed_model", True)
+                if tuning_note:
+                    ai_activities.append(tuning_note)
             if explicit_time_series_changes:
                 ai_changes.update(explicit_time_series_changes)
                 ai_changes.setdefault("proceed_model", True)
@@ -303,6 +367,25 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
             if ai_changes:
                 activities.extend(ai_activities)
                 activities.append("Auto mode used the KB and user requirements for AI-driven suggestions.")
+                # Validate requirement-driven feature selection and tuning for compatibility.
+                problem_type = str(ai_changes.get("problem_type") or state.get("problem_type") or "")
+                model_name = str(ai_changes.get("model_name") or state.get("model_name") or "")
+                model_family = str(ai_changes.get("model_family") or state.get("model_family") or "")
+                if ai_changes.get("feature_selection") == "Stepwise":
+                    if problem_type == "classification" and model_name and model_name != "Logistic Regression":
+                        ai_changes.pop("feature_selection", None)
+                        ai_changes.pop("stepwise_direction", None)
+                        activities.append("Requirement not applied: Stepwise is only supported for Logistic Regression.")
+                    elif problem_type == "regression" and model_name and model_name != "Linear Regression":
+                        ai_changes.pop("feature_selection", None)
+                        ai_changes.pop("stepwise_direction", None)
+                        activities.append("Requirement not applied: Stepwise is only supported for Linear Regression.")
+                if problem_type == "time_series" and "tuning_method" in ai_changes:
+                    ai_changes.pop("tuning_method", None)
+                    activities.append("Requirement not applied: tuning is not supported for time series.")
+                if model_family == "Statistical" and ai_changes.get("tuning_method") not in {None, "None"}:
+                    ai_changes.pop("tuning_method", None)
+                    activities.append("Requirement not applied: tuning is disabled for Statistical models.")
                 # Start with AI changes; rule-based defaults will only fill missing keys.
                 # Enforce model_family alignment if AI suggested a model_name without family
                 mname = ai_changes.get("model_name")
@@ -479,6 +562,8 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
             if state.get("agent_goal"):
                 req_texts.append(str(state.get("agent_goal")))
             req_blob = " ".join(req_texts).lower()
+            feature_changes, feature_note = _extract_feature_selection_request(req_texts)
+            tuning_changes, tuning_note = _extract_tuning_request(req_texts)
             preferences = state.get("agent_preferences") or {}
             preferred_family = preferences.get("preferred_model_family")
             preferred_model_name = preferences.get("preferred_model_name")
@@ -505,6 +590,40 @@ def apply_auto_actions_snapshot(state: Dict[str, Any], step: int, df: pd.DataFra
                     changes["time_series_mode"] = "Auto ARIMA"
                 activities.append("Prepared time-series defaults: time column, model, and Auto ARIMA mode.")
             else:
+                if feature_changes:
+                    requested_selection = feature_changes.get("feature_selection")
+                    model_name = str(state.get("model_name") or changes.get("model_name") or "")
+                    if requested_selection == "Stepwise":
+                        if problem_type == "classification" and model_name and model_name != "Logistic Regression":
+                            activities.append("Requirement not applied: Stepwise is only supported for Logistic Regression.")
+                        elif problem_type == "regression" and model_name and model_name != "Linear Regression":
+                            activities.append("Requirement not applied: Stepwise is only supported for Linear Regression.")
+                        else:
+                            for key, value in feature_changes.items():
+                                if key not in state and key not in changes:
+                                    changes[key] = value
+                            if feature_note:
+                                activities.append(feature_note)
+                    else:
+                        for key, value in feature_changes.items():
+                            if key not in state and key not in changes:
+                                changes[key] = value
+                        if feature_note:
+                            activities.append(feature_note)
+                elif feature_note:
+                    activities.append(feature_note)
+                if tuning_changes and "tuning_method" not in state and "tuning_method" not in changes:
+                    model_family = str(state.get("model_family") or changes.get("model_family") or "")
+                    if problem_type == "time_series":
+                        activities.append("Requirement not applied: tuning is not supported for time series.")
+                    elif model_family == "Statistical" and tuning_changes.get("tuning_method") not in {None, "None"}:
+                        activities.append("Requirement not applied: tuning is disabled for Statistical models.")
+                    else:
+                        changes["tuning_method"] = tuning_changes["tuning_method"]
+                        if tuning_note:
+                            activities.append(tuning_note)
+                elif tuning_note:
+                    activities.append(tuning_note)
                 if "model_family" not in state and "model_family" not in changes:
                     if preferred_family in {"Statistical", "ML"}:
                         changes["model_family"] = preferred_family

@@ -68,13 +68,6 @@ def render_chat_dock() -> None:
                     reqs.insert(0, {"text": user_text, "time": datetime.now().isoformat()})
                     st.session_state["agent_requirements"] = reqs[:50]
                     msgs = st.session_state.get("agent_chat_messages", [])
-                    requirement_reply = "Noted. Requirement recorded."
-                    msgs.append({"role": "assistant", "content": requirement_reply})
-                    st.session_state["agent_chat_messages"] = msgs[-50:]
-                    update_conversation_memory_from_assistant(requirement_reply)
-                    activity = st.session_state.get("agent_activity", [])
-                    activity.insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(), "level": "info", "message": "Requirement recorded via chat."})
-                    st.session_state["agent_activity"] = activity[:50]
                     # Parse and apply the requirement immediately so the UI and auto-engine honor it.
                     from ai_agent.copilot_utils import apply_requirement_to_state
                     applied = apply_requirement_to_state(user_text)
@@ -82,6 +75,20 @@ def render_chat_dock() -> None:
                         activity = st.session_state.get("agent_activity", [])
                         activity.insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(), "level": "info", "message": a})
                         st.session_state["agent_activity"] = activity[:50]
+                    applied_any = any(str(note).lower().startswith("applied requirement") for note in applied)
+                    failed_notes = [note for note in applied if str(note).lower().startswith("requirement not applied")]
+                    if failed_notes:
+                        requirement_reply = str(failed_notes[0])
+                    elif applied_any:
+                        requirement_reply = "Noted. Requirement applied."
+                    else:
+                        requirement_reply = "I could not apply that requirement. Please specify a supported option."
+                    msgs.append({"role": "assistant", "content": requirement_reply})
+                    st.session_state["agent_chat_messages"] = msgs[-50:]
+                    update_conversation_memory_from_assistant(requirement_reply)
+                    activity = st.session_state.get("agent_activity", [])
+                    activity.insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(), "level": "info", "message": "Requirement recorded via chat."})
+                    st.session_state["agent_activity"] = activity[:50]
                     return
 
                 if is_unsupported_statistical_request(user_text):

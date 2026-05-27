@@ -16,6 +16,10 @@ from ai_agent.config import (
 	REGRESSION_MODELS,
 	STATISTICAL_CLASSIFICATION_MODELS,
 	STATISTICAL_REGRESSION_MODELS,
+	FEATURE_SELECTION_METHODS,
+	MODEL_BASED_OPTIONS,
+	STEPWISE_DIRECTIONS,
+	TUNING_METHODS,
 )
 from ai_agent.llm_client import call_groq, groq_token_loaded
 from ai_agent.rag_store import build_workflow_rag_context
@@ -42,6 +46,25 @@ def is_requirement_message(user_text: str) -> bool:
 		return True
 	if _looks_like_question(txt):
 		return False
+	if any(token in lower for token in [
+		"feature selection",
+		"feature selector",
+		"hyperparameter",
+		"tuning method",
+		"tuning",
+		"grid search",
+		"optuna",
+		"tpe",
+		"rfe",
+		"selectkbest",
+		"stepwise",
+		"model based",
+		"model-based",
+		"no tuning",
+		"disable tuning",
+		"no feature selection",
+	]):
+		return True
 	requirement_phrases = (
 		"must",
 		"need to",
@@ -307,6 +330,64 @@ def infer_time_series_configuration(user_text: str) -> Dict[str, Any]:
 	if any(token in text for token in ["seasonal 12", "seasonality 12", "period 12", "m=12"]):
 		config["hw_seasonal_periods"] = 12
 	return config
+
+
+def _extract_feature_selection_request(text: str) -> Dict[str, Any]:
+	request = _normalize_request_text_local(text)
+	compact = request.replace(" ", "")
+	result: Dict[str, Any] = {}
+
+	feature_hits: List[Tuple[int, str]] = []
+	if any(phrase in request for phrase in ["no feature selection", "disable feature selection", "feature selection none"]):
+		feature_hits.append((_last_match_index(request, ["no feature selection", "disable feature selection", "feature selection none"]), "None"))
+	if "rfe" in request:
+		feature_hits.append((request.rfind("rfe"), "RFE"))
+	if "selectkbest" in compact or "select k best" in request or "k best" in request:
+		feature_hits.append((_last_match_index(request, ["selectkbest", "select k best", "k best"]), "SelectKBest"))
+	if "model based" in request or "model-based" in request:
+		feature_hits.append((_last_match_index(request, ["model based", "model-based"]), "Model-based"))
+	if "stepwise" in request:
+		feature_hits.append((request.rfind("stepwise"), "Stepwise"))
+
+	if feature_hits:
+		feature_hits.sort(key=lambda item: item[0], reverse=True)
+		result["feature_selection"] = feature_hits[0][1]
+		if result["feature_selection"] == "Model-based":
+			if any(token in request for token in ["lasso", "l1"]):
+				result["model_based"] = "L1/Lasso"
+			elif any(token in request for token in ["tree", "importance"]):
+				result["model_based"] = "Tree importance"
+		if result["feature_selection"] == "Stepwise":
+			if "backward" in request:
+				result["stepwise_direction"] = "backward"
+			elif any(token in request for token in ["bidirectional", "both"]):
+				result["stepwise_direction"] = "bidirectional"
+			else:
+				result["stepwise_direction"] = "forward"
+	return result
+
+
+def _extract_tuning_request(text: str) -> Dict[str, Any]:
+	request = _normalize_request_text_local(text)
+	compact = request.replace(" ", "")
+	result: Dict[str, Any] = {}
+
+	method_hits: List[Tuple[int, str]] = []
+	if any(phrase in request for phrase in ["no tuning", "disable tuning", "tuning none", "no hyperparameter tuning"]):
+		method_hits.append((_last_match_index(request, ["no tuning", "disable tuning", "tuning none", "no hyperparameter tuning"]), "None"))
+	if "grid search" in request or "gridsearch" in compact:
+		method_hits.append((_last_match_index(request, ["grid search", "gridsearch"]), "Grid Search"))
+	if "optuna" in request or "tpe" in request:
+		method_hits.append((_last_match_index(request, ["optuna", "tpe"]), "TPE (Optuna)"))
+	if "manual" in request:
+		method_hits.append((request.rfind("manual"), "Manual"))
+	if "tuning" in request or "hyperparameter" in request:
+		method_hits.append((_last_match_index(request, ["tuning", "hyperparameter"]), "Grid Search"))
+
+	if method_hits:
+		method_hits.sort(key=lambda item: item[0], reverse=True)
+		result["tuning_method"] = method_hits[0][1]
+	return result
 
 
 def update_conversation_memory_from_user(user_text: str) -> None:
@@ -577,8 +658,62 @@ def apply_requirement_to_state(req_text: str) -> List[str]:
 		st.session_state["model_selection_hint"].update({"interpretability": True, "flexible": True})
 		notes.append("Applied requirement: prefer interpretable / explainable models (hint set)")
 
+	# Feature selection and tuning requirements
+	feature_request = _extract_feature_selection_request(req_text)
+	if feature_request:
+		requested_method = feature_request.get("feature_selection")
+		if requested_method and requested_method not in FEATURE_SELECTION_METHODS:
+			notes.append("Requirement not applied: feature selection option not supported.")
+		else:
+			model_name = str(st.session_state.get("model_name") or "")
+			problem_type = str(st.session_state.get("problem_type") or "")
+			if requested_method == "Stepwise":
+				if problem_type == "classification" and model_name and model_name != "Logistic Regression":
+					notes.append("Requirement not applied: Stepwise is only supported for Logistic Regression.")
+				elif problem_type == "regression" and model_name and model_name != "Linear Regression":
+					notes.append("Requirement not applied: Stepwise is only supported for Linear Regression.")
+				else:
+					st.session_state["feature_selection"] = "Stepwise"
+					notes.append("Applied requirement: feature_selection = Stepwise")
+			else:
+				if requested_method:
+					st.session_state["feature_selection"] = requested_method
+					notes.append(f"Applied requirement: feature_selection = {requested_method}")
+				if feature_request.get("model_based"):
+					model_based = feature_request["model_based"]
+					if model_based in MODEL_BASED_OPTIONS:
+						st.session_state["model_based"] = model_based
+						notes.append(f"Applied requirement: model_based = {model_based}")
+				if feature_request.get("stepwise_direction"):
+					direction = feature_request["stepwise_direction"]
+					if direction in STEPWISE_DIRECTIONS:
+						st.session_state["stepwise_direction"] = direction
+						notes.append(f"Applied requirement: stepwise_direction = {direction}")
+	elif any(token in txt for token in ["feature selection", "feature selector", "feature-selection", "rfe", "selectkbest", "stepwise", "model based", "model-based"]):
+		notes.append("Requirement not applied: feature selection option not recognized.")
+
+	tuning_request = _extract_tuning_request(req_text)
+	if tuning_request:
+		requested_tuning = tuning_request.get("tuning_method")
+		problem_type = str(st.session_state.get("problem_type") or "")
+		model_family = str(st.session_state.get("model_family") or "")
+		if requested_tuning and requested_tuning not in TUNING_METHODS:
+			notes.append("Requirement not applied: tuning method not supported.")
+		elif problem_type == "time_series":
+			notes.append("Requirement not applied: tuning is not supported for time series.")
+		elif model_family == "Statistical" and requested_tuning and requested_tuning != "None":
+			notes.append("Requirement not applied: tuning is disabled for Statistical models.")
+		else:
+			if requested_tuning:
+				st.session_state["tuning_method"] = requested_tuning
+				notes.append(f"Applied requirement: tuning_method = {requested_tuning}")
+	elif any(token in txt for token in ["tuning", "hyperparameter", "grid search", "optuna", "tpe", "manual"]):
+		notes.append("Requirement not applied: tuning method not recognized.")
+
 	# Persist a simple flag so other code paths can notice a recent requirement application
 	st.session_state["agent_requirement_last_applied"] = datetime.now().isoformat()
+	if not notes:
+		notes.append("Requirement not applied: no supported options detected.")
 	return notes
 
 
@@ -769,7 +904,9 @@ def build_copilot_context(step: int, df: Optional[pd.DataFrame], summary: Any) -
 	parts.append(
 		"System policy: Auto AI records requirement-style chat messages and selects actions for the workflow."
 		" Treat explicit requirements and constraints as record-only, but keep question-like or advice-seeking messages as questions."
-		" Acknowledge requirements with a short 'Noted' and record them. Do not mention which model is speaking."
+		" Acknowledge requirements with a short 'Noted' and record them."
+		" If a requirement is unsupported or incompatible, reply with a short clarification that names the limitation."
+		" Do not mention which model is speaking."
 		" Match statistical questions to the supported diagnostic by intent, not just by exact tool name; for example, 'normally distributed' maps to normality analysis (Shapiro-Wilk/Jarque-Bera)."
 		" Likewise, 'constant variance', 'homoscedasticity', or 'heteroskedasticity' map to heteroscedasticity analysis."
 		" Avoid self-interpretations such as 'the user wants'. Do not echo internal planning JSON or tool payloads."
