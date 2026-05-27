@@ -6,4 +6,5 @@ I integrated LangChain with the LLM workflow to allow statistical tool requests 
 
 Next, I integrated a knowledge base as RAG for the LLM to retrieve guidance that helps automate the data modeling process through the application. The RAG contains the data modeling options and recommendations according to the EDA processes conducted by the app. Once auto mode is enabled, the LLM will recommend the most suitable data cleaning approach and data modeling techniques, which include feature selection and hyperparameter tuning. 
 
-Users can also override the AI's selection via direct modification, or instruct through the chatbox provided in the left sidebar. If users prefer to conduct data modeling themselves, Auto AI mode can be turned off. Users can then conduct EDA through various summaries and visualization techniques. No worries, the AI assistant is still there to provide hints from time to time. 
+Users can also override the AI's selection via direct modification, or instruct through the chatbox provided in the left sidebar. If users prefer to conduct data modeling themselves, Auto AI mode can be turned off. Users can then conduct EDA through various summaries and visualization techniques. No worries, the AI assistant is still there to provide hints from time to time.   
+
